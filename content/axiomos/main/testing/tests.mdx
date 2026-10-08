@@ -1,0 +1,143 @@
+import { Callout } from 'nextra/components'
+
+# Tests
+
+Relevant source files
+
+- [CONTRIBUTING.md](https://github.com/pro-utkarshM/axiomOS/blob/main/CONTRIBUTING.md)
+- [scripts/verify/gates/core.sh](https://github.com/pro-utkarshM/axiomOS/blob/main/scripts/verify/gates/core.sh)
+- [scripts/verify/gates/extended.sh](https://github.com/pro-utkarshM/axiomOS/blob/main/scripts/verify/gates/extended.sh)
+- [scripts/verify/gates/miri.sh](https://github.com/pro-utkarshM/axiomOS/blob/main/scripts/verify/gates/miri.sh)
+- [scripts/test/smoke-bpf.sh](https://github.com/pro-utkarshM/axiomOS/blob/main/scripts/test/smoke-bpf.sh)
+- [kernel/crates/kernel_bpf/tests](https://github.com/pro-utkarshM/axiomOS/blob/main/kernel/crates/kernel_bpf/tests)
+- [kernel/crates/kernel_bpf/fuzz/README.md](https://github.com/pro-utkarshM/axiomOS/blob/main/kernel/crates/kernel_bpf/fuzz/README.md)
+- [kernel/tests](https://github.com/pro-utkarshM/axiomOS/blob/main/kernel/tests)
+- [tests/scripts](https://github.com/pro-utkarshM/axiomOS/blob/main/tests/scripts)
+
+## Host crate tests
+
+Because the kernel binary cannot host standard unit tests, tests live in the `kernel/crates/*` subsystem crates and run on the host.
+
+```bash
+cargo test                       # testable crates
+cargo test -p kernel_abi
+cargo test -p kernel_vfs
+cargo test -p kernel_bpf --no-default-features --features cloud-profile
+cargo test -p kernel_bpf --no-default-features --features embedded-profile
+```
+
+`kernel_bpf` requires exactly one profile feature, so always pass `--no-default-features` plus `cloud-profile` or `embedded-profile`. A CI job verifies that building with both profiles, or with neither, fails.
+
+The required gate's `focused-host-tests` step runs `cargo test` for `kernel_abi`, `kernel_elfloader`, `kernel_physical_memory`, `kernel_syscall`, `kernel_time`, `kernel_usermem`, `kernel_vfs`, `kernel_map_transaction`, `kernel_virtual_memory` and `shrike_link`. The extended and full profiles repeat these in `--release`.
+
+### Integration test files
+
+| Crate | Test files |
+|-------|-----------|
+| `kernel_bpf` | `bpf_integration.rs`, `bpf_to_bpf_calls.rs`, `gpio_integration.rs`, `pwm_integration.rs`, `profile_contracts.rs`, `semantic_consistency.rs`, `actuation_property.rs`, `concurrency_model.rs`, plus `fixtures/` |
+| `kernel_elfloader` | `audit_h05_malformed.rs`, `exec_rollback.rs` |
+| `kernel_run_queue` | `concurrency_model.rs` |
+| `kernel_device`, `kernel_pci` | `contracts.rs` |
+
+What the notable ones assert, taken from their header comments:
+
+| File | Purpose |
+|------|---------|
+| `semantic_consistency.rs` | The same BPF bytecode produces the same result regardless of profile (no semantic drift between cloud and embedded) |
+| `profile_contracts.rs` | Each profile keeps its documented constraints; compile-time erasure works |
+| `bpf_to_bpf_calls.rs` | BPF-to-BPF calls normalize, then verify |
+| `actuation_property.rs` | Property test: over random requests and monotonic time, the applied output always stays within the channel envelope and never slews faster than the maximum step. Skipped under Miri because proptest is too slow there |
+| `audit_h05_malformed.rs` | Truncated or out-of-bounds ELF input must not panic the parser |
+| `exec_rollback.rs` | Under injected allocation failure the ELF loader returns a typed `AllocationFailed` and leaks nothing |
+| `concurrency_model.rs` | Loom exhaustive interleaving models (`EpochSnapshot` reclamation in `kernel_bpf`, run queue in `kernel_run_queue`) |
+
+### Loom models
+
+```bash
+RUSTFLAGS=--cfg=loom cargo test --locked -p kernel_run_queue --test concurrency_model
+cargo test --locked -p kernel_bpf --features loom-model,cloud-profile --test concurrency_model
+```
+
+### Miri
+
+```bash
+cargo miri setup
+cargo miri test -p kernel_abi
+cargo miri test -p kernel_bpf --no-default-features --features cloud-profile
+```
+
+The audit gate runs Miri for `kernel_bpf` (cloud profile) in non-quick modes, and in the `full` profile for every other crate under `kernel/crates` that has a `Cargo.toml`. GitHub's Miri job runs only the cloud profile because the embedded-profile matrix entry hung in CI and was dropped until understood.
+
+## Kernel-level fault harnesses
+
+`kernel/tests/bpf_attachment_fault.rs` and `bpf_handles_fault.rs` are not Cargo test targets. They `#[path]`-include the production source (for example `verifier/admission.rs`) and are compiled directly by the audit gate with `rustc --edition 2021 -D warnings --test`, so fault-injection tests run against the real code without constructing the boot-only manager. Several other kernel modules (heap policy, wait protocol, pipe state, ACPI mapping, executable limits) are tested the same way, plus Python "static" steps that assert source structure.
+
+## Script and tooling tests
+
+Python tests in `tests/scripts/` are run by the gate with `python3 -B`.
+
+| File | Covers |
+|------|--------|
+| `test_xtask_cli.py` | End-to-end contracts for the `cargo xtask` command surface |
+| `test_quality.py` | Provenance of historical mutation evidence |
+| `test_gpio23_probe.py`, `test_shrike_gpio23_probe.py` | Human-action prompt and Shrike pulse harness |
+| `test_v03d_estop_cycle.py` | The unloaded e-stop runner with a PTY UART and fake instruments |
+| `test_pwm_containment_helper.py` | PWM helper validation and bench correlation |
+| `test_rpi5_peripheral_output.py` | GPIO setup methods against host register storage |
+| `test_rpi5_target_dir.py` | An overridden Cargo target supplies the deployed image and provenance |
+| `check_link_trace_image.py` | Opt-in poll trace and safety records in a built Pi ELF |
+
+The xtask crate has its own unit tests (`cargo test --locked -p xtask`, exposed as `cargo xtask check host-tests`).
+
+## QEMU smoke tests
+
+| Check | Where | Asserts |
+|-------|-------|---------|
+| `scripts/test/smoke-bpf.sh` | Manual | `sched_switch_export_demo` completes map create, load, attach and pin; no verifier rejection or panic |
+| `qemu-release-smoke` (smp 2) | Audit gate | `QEMU_BOOT_OK`, `USERCOPY_EFAULT_OK`, `UNKNOWN_SYSCALL_ENOSYS_OK`, `NANOSLEEP_WAITQ_OK`, `NANOSLEEP_INTERRUPT_OK` and further init markers, `INIT_PROCESS_STARTED`; no panic |
+| `qemu-smp1-smoke` | Audit gate | `QEMU_BOOT_OK`, `INIT_PROCESS_STARTED` |
+| `qemu-smp4-scheduler-smoke` | Audit gate | Those plus `SMP4_SCHEDULER_OK` |
+| `qemu-production-signed-smoke` (smp 2) | Audit gate | A production-style signed build without the unsigned feature: `QEMU_BOOT_OK`, wait-queue and lifecycle markers, `SIGNED_BPF_LOAD_OK`, a nanosleep benchmark line; fails if the unsigned demo path runs or a signed-loader failure marker appears |
+| `audit-fault-injection-qemu-smoke` | Gate, only with `RUN_AUDIT_FAULT=1` | Fault-injection probe markers |
+| `aarch64-exception-context.py` | Gate (when QEMU enabled) and CI | Production AArch64 exception vectors with register canaries under QEMU. Emulator evidence, not Pi timing |
+
+These smoke runs use `--features bpf-unsigned-development,audit-diagnostics`. GitHub's `qemu-kernel-smoke` job boots the release ISO with `--features audit-diagnostics` and a CI-fixture trust key.
+
+<Callout type="info">
+The smp1 smoke records, without failing, any post-boot ring-3 panic text. It proves boot markers under `--smp 1`, not sustained userspace stability after `QEMU_BOOT_OK`.
+</Callout>
+
+## Fuzzing
+
+Fuzz harnesses are standalone `cargo-fuzz` workspaces (excluded from the root workspace).
+
+| Crate | Target | Oracle |
+|-------|--------|--------|
+| `kernel_bpf` | `verify_only` | Verifier terminates on every input within bounded resources, never panics |
+| `kernel_bpf` | `verify_then_exec` | A program the verifier accepts must execute in the interpreter without panic. A failure here is a verifier soundness bug |
+| `kernel_bpf` | `signed_container` | Signed containers parse without panic, round-trip headers, accept only matching payload hashes |
+| `kernel_bpf` | `ringbuf_sequences` | Stateful FIFO model across wraparound and full-buffer rejection |
+| `kernel_elfloader` | `parse_and_load` | Malformed ELF parse and load |
+| `kernel_syscall` | `mmap_arguments` | Syscall `mmap` arguments |
+| `rk_bridge` | `event_stream` | Host bridge event parsing |
+
+```bash
+cargo install cargo-fuzz
+cd kernel/crates/kernel_bpf
+cargo fuzz run verify_only -- -max_total_time=60
+# Reproduce a crash
+cargo fuzz run verify_only fuzz/artifacts/verify_only/crash-HASH
+```
+
+Inputs to the verifier targets are reinterpreted as an array of 8-byte `BpfInsn`.
+
+| Workflow job | Trigger | Budget |
+|--------------|---------|--------|
+| Fuzz smoke `verify_only` | Pull request touching the relevant paths | 60 s |
+| Fuzz smoke ELF parse and load | Pull request | 60 s |
+| Fuzz build `rk_bridge event_stream` | Pull request | build only |
+| Weekly `verify_only`, `verify_then_exec` | Sunday 02:30 UTC and manual | 7200 s each |
+| Weekly `signed_container`, `ringbuf_sequences` | Same | 600 s each |
+| Weekly ELF, syscall mmap, `rk_bridge event_stream` | Same | 600 s each |
+
+Weekly runs restore and upload corpora; crashes upload as artifacts. The `full` and `extended` local profiles include fuzz-build checks; actual long fuzz campaigns run on GitHub schedules or manually.

@@ -1,0 +1,102 @@
+import { Callout } from 'nextra/components'
+
+# RP1 Peripherals
+
+<details>
+<summary>Relevant source files</summary>
+
+- [kernel/src/arch/aarch64/platform/rpi5/gpio.rs](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/kernel/src/arch/aarch64/platform/rpi5/gpio.rs)
+- [kernel/src/arch/aarch64/platform/rpi5/pwm.rs](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/kernel/src/arch/aarch64/platform/rpi5/pwm.rs)
+- [kernel/src/arch/aarch64/platform/rpi5/uart.rs](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/kernel/src/arch/aarch64/platform/rpi5/uart.rs)
+- [kernel/src/arch/aarch64/platform/rpi5/pl011.rs](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/kernel/src/arch/aarch64/platform/rpi5/pl011.rs)
+- [kernel/src/arch/aarch64/platform/rpi5/mmio.rs](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/kernel/src/arch/aarch64/platform/rpi5/mmio.rs)
+- [kernel/src/arch/aarch64/platform/rpi5/memory_map.rs](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/kernel/src/arch/aarch64/platform/rpi5/memory_map.rs)
+- [kernel/src/arch/aarch64/interrupts.rs](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/kernel/src/arch/aarch64/interrupts.rs)
+- [kernel/src/syscall/bpf.rs](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/kernel/src/syscall/bpf.rs)
+- [kernel/src/actuation.rs](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/kernel/src/actuation.rs)
+- [kernel/src/bench.rs](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/kernel/src/bench.rs)
+
+</details>
+
+RP1 is the Raspberry Pi 5's southbridge. It is a separate chip reached from the BCM2712 over PCIe (the PCIe2 link), and it holds the 40-pin-header peripherals. axiomOS has no PCIe or device-tree-driven driver model for it: the kernel uses fixed physical addresses inside a window the firmware has already set up (see [Raspberry Pi 5](/axiomos/v0.5.0-alpha.3/platform/raspberry-pi-5) for the `config.txt` shortcuts).
+
+## Register access
+
+[`mmio.rs`](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/kernel/src/arch/aarch64/platform/rpi5/mmio.rs) provides `MmioReg<T>`, a volatile register wrapper with `read`, `write`, `modify`, `set_bits`, `clear_bits`, `is_set`, `wait_set` and `wait_clear` (the waits spin).
+
+RP1 registers are addressed as `RP1_PERIPHERAL_BASE + offset`, where the base is the higher-half alias of physical `0x1F_0000_0000`:
+
+| Block | RP1 offset | Status |
+|---|---|---|
+| UART0 (PL011-compatible) | `0x0003_0000` | Used by the Shrike control link |
+| UART1 | `0x0003_4000` | Address defined; no driver found |
+| I2C0 | `0x0007_0000` | Address defined; no driver found |
+| SPI0 | `0x0005_0000` | Address defined; no driver found |
+| PWM0 | `0x0009_8000` | Driver |
+| PWM1 | `0x0009_C000` | Driver |
+| IO_BANK0 (GPIO) | `0x000D_0000` | Driver |
+
+The GPIO status and control bit fields are annotated in comments as taken from the Linux `pinctrl-rp1.c` source.
+
+## GPIO
+
+[`gpio.rs`](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/kernel/src/arch/aarch64/platform/rpi5/gpio.rs) implements `Rp1Gpio` for the **28 user GPIOs** (`NUM_PINS = 28`; out-of-range pins assert). Each pin has a status register and a control register at an 8-byte stride from the IO_BANK0 base.
+
+| Feature | API |
+|---|---|
+| Function select | `set_function` with `GpioFunction` (`Input`, `Output`, `Alt0` to `Alt5`); `get_function` |
+| Output | `set_high`, `set_low`, `toggle` (through the output-override field), `configure_output` |
+| Input | `read`, `configure_input` |
+| Edge events | `enable_interrupt(pin, rising, falling)`, `disable_interrupt`, `clear_interrupt`, `get_pending_events`, `has_rising_event`, `has_falling_event` |
+| UART pinmux | `setup_uart` sets GPIO14 and GPIO15 to `Alt0` |
+
+A `GpioPull` enum (`None`, `Down`, `Up`) is defined, but no pull-configuration method exists in the driver. Level-triggered event bits are defined but marked unused; the code arms rising and falling edges only.
+
+### GPIO interrupt route
+
+`interrupts::init` on `rpi5` enables GIC interrupt ID 261 at priority `0x80`, and `handle_irq` dispatches it to `gpio::handle_interrupt`. The source comments derive ID 261 from the BCM2712 device tree: PCIe2 INTA is GIC SPI 229, and SPI N is interrupt ID 32 + N. The comments also note that the RP1 has its own internal interrupt controller, with GPIO bank 0 as RP1 interrupt 0, and that a full implementation would need to read the RP1 interrupt status registers to tell peripherals apart.
+
+`handle_interrupt` takes a timestamp from the generic counter, scans all 28 pins for pending event bits, classifies each as rising, falling or both, reads the pin level, clears the pin's event, builds a `GpioEvent` (chip 0, line, edge, value) and runs the attached GPIO BPF programs through `BpfManager::run_gpio_programs`. Spurious or level-only events are cleared and skipped.
+
+<Callout type="warning">
+  No code in the kernel at this release configures the RP1 side of the interrupt path (RP1 interrupt enables, PCIe interrupt delivery) or the BCM2712 PCIe2 side. Whether a GPIO edge actually reaches GIC ID 261 depends on state left by the firmware, and this was not confirmed from the source. The GPIO interrupt HIL evidence required by ADR-0003 is also a pending checklist item, not a recorded result.
+</Callout>
+
+### How GPIO is used by the rest of the kernel
+
+- `sys_bpf` attach for GPIO edges: after the BPF manager records the route, the pin is configured as input and its edge interrupt enabled.
+- BPF helpers and `actuation::guard_gpio` write pins through `Rp1Gpio`, with the actuation monitor deciding first.
+- `bench.rs` (compiled only with the `bench` feature) uses GPIO23 as a sensor input and GPIO24 as an e-stop input (see [Raspberry Pi 5](/axiomos/v0.5.0-alpha.3/platform/raspberry-pi-5)).
+
+## PWM
+
+[`pwm.rs`](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/kernel/src/arch/aarch64/platform/rpi5/pwm.rs) drives PWM0 and PWM1, each with two channels. The register accessors are named after the BCM2835 PWM block layout: `CTL` at `0x00`, `STA` at `0x04`, `RNG1`/`DAT1` at `0x10`/`0x14` and `RNG2`/`DAT2` at `0x20`/`0x24`.
+
+- **Channel numbering is 1-based** (channels 1 and 2), to match the actuation monitor. GPIO12 (`Alt0`) is the bench PWM output, treated as PWM0 channel 1.
+- **API:** `init` (clears the control register and status bits), `enable` (sets the channel enable and mark/space bits), `disable`, `set_range`, `set_data`, `set_frequency`, `set_duty_cycle` (percent). `enable`, `disable`, `set_frequency` and `set_duty_cycle` also fire the PWM BPF hook once the BPF manager exists.
+- **Assumed clock:** `set_frequency` assumes a 125 MHz input clock, and the event period and duty values are computed as `range * 8` ns. This is an assumption in the source; the driver does not enable or configure an RP1 PWM clock.
+- **Motor ownership:** actuation channels 1 and 2 on chip 0 are owned by the signed Shrike motor link in normal builds (`control_link::motor_side`), so local RP1 PWM is not what drives the wheels on those channels. See [Drivers](/axiomos/v0.5.0-alpha.3/platform/drivers).
+
+## UARTs
+
+| Role | Hardware | Driver |
+|---|---|---|
+| Kernel console | BCM2712 PL011 UART10 at `0x10_7D00_1000` (not RP1) | `uart.rs`, no-op init relying on firmware; blocking and non-blocking RX, blocking TX |
+| Shrike control link | RP1 UART0 on GPIO14/15 | `pl011.rs`, real init at 115200 8N1 with a 48 MHz UART clock default, polled |
+
+The control-link PL011 driver masks all interrupts; `enable_rx_irq` exists but the comments state IRQ-driven RX is deferred because it needs the RP1 peripheral IRQ demux (issue 65). The `rpi5/mod.rs` module also creates `UART`, `PWM0` and `PWM1` as lazily initialized mutex-guarded globals.
+
+## What is missing
+
+The README states there are **no I2C, SPI, CAN or Ethernet drivers**, and only GPIO, PWM and UART exist on RP1. The source agrees:
+
+| Peripheral | State |
+|---|---|
+| I2C, SPI | Only base offset constants (`RP1_I2C0_OFFSET`, `RP1_SPI0_OFFSET`); no driver. The IIO module's header says it will interface with I2C/SPI drivers in future |
+| CAN, Ethernet | No driver |
+| UART1 | Address constant only |
+| RP1 peripheral interrupt demux | Not implemented (IRQ-driven UART RX deferred) |
+| PCIe and RP1 interrupt-controller setup | Not implemented; RP1 is used through fixed addresses, relying on `pciex4_reset=0` |
+| DMA, USB, SD/MMC, ADC | No driver found |
+
+Issue references from the README for the missing drivers include 63 and 64 (and others on the roadmap, issue 81).

@@ -1,0 +1,127 @@
+import { Callout } from 'nextra/components'
+
+# CI and Gates
+
+Relevant source files
+
+- [ci/README.md](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/ci/README.md)
+- [ci/profiles/quick.toml](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/ci/profiles/quick.toml)
+- [ci/profiles/full.toml](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/ci/profiles/full.toml)
+- [ci/profiles/extended.toml](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/ci/profiles/extended.toml)
+- [ci/manifests/commands.toml](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/ci/manifests/commands.toml)
+- [ci/manifests/targets.toml](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/ci/manifests/targets.toml)
+- [tools/xtask/src/commands.rs](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/tools/xtask/src/commands.rs)
+- [scripts/verify/engineering-audit.sh](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/scripts/verify/engineering-audit.sh)
+- [.github/workflows/build.yml](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/.github/workflows/build.yml)
+- [.github/workflows/bpf-profiles.yml](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/.github/workflows/bpf-profiles.yml)
+- [.github/workflows/fuzz.yml](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/.github/workflows/fuzz.yml)
+
+## Policy as data
+
+`ci/manifests/` is the sole declarative policy authority, consumed by xtask, Cargo build orchestration and the local audit gate. `ci/README.md` forbids compatibility copies at the `ci/` root.
+
+| Manifest | Content |
+|----------|---------|
+| `components.toml` | Every component: path, workspace membership, artifact disposition, role, required gate |
+| `targets.toml` | Target triples and support status |
+| `artifacts.toml` | Produced-image contracts, rendered into `docs/reference/generated/artifacts.md` |
+| `commands.toml` | Public command smoke checks (`argv`, expected output) |
+| `quality.toml` | Coverage and mutation-testing dispositions per component |
+| `build-inputs.env` | Immutable external revisions (Limine, OVMF) |
+
+`cargo xtask docs` renders these into `docs/reference/generated/*.md`; `cargo xtask docs --check` fails when the generated files drift.
+
+## Profiles
+
+`ci/profiles/*.toml` describe intended scope.
+
+| Profile | Checks listed |
+|---------|---------------|
+| `quick` | formatting, inventory, boundary, docs, host-tests |
+| `full` | inventory, boundary, docs, quality, host-tests, models, release |
+| `extended` | full plus fuzz, formal, hil |
+
+<Callout type="warning">
+`ci/README.md` states that profile dispatch is still being migrated into the typed xtask surface; profile names and check ids are policy data while the implementations remain in Rust, Python and shell. In practice `--profile quick`, `full` and `extended` are translated to the flags `--quick`, `--full` and `--extended` of `scripts/verify/engineering-audit.sh`. The `hil` entry in `extended.toml` is a declared check id; `engineering-audit.sh` itself contains no physical-hardware step, and the repository has no hardware-in-the-loop CI.
+</Callout>
+
+## cargo xtask check
+
+```bash
+cargo xtask check inventory      # component inventory
+cargo xtask check boundary       # workspace/artifact boundary
+cargo xtask check docs           # generated docs up to date
+cargo xtask check abi            # scripts/verify/abi-surface.py
+cargo xtask check error-policy   # scripts/verify/error-policy.py
+cargo xtask check target-boundary
+cargo xtask check unsafe         # scripts/verify/unsafe-ledger.py --check
+cargo xtask check host-tests     # cargo test --locked -p xtask
+cargo xtask check all [--profile quick or full or extended] [--format human or json] [audit options]
+```
+
+`check all` creates `artifacts/runs/TIMESTAMP-check-all/`. With `--format json` it prints `summary.json` from that directory. `cargo xtask ci [--quick or --full or --extended]` is the older entry point: it additionally validates inventory, boundary and generated docs before invoking the audit script. Extra flags pass through to the audit script, for example `--no-qemu`.
+
+## The audit gate
+
+`scripts/verify/engineering-audit.sh` is the canonical local gate. Options:
+
+| Option | Effect |
+|--------|--------|
+| `--quick` | Formatting, ledger, focused tests and kernel checks; no Miri, no QEMU |
+| `--extended` | Adds release-profile tests, Lean when installed, and Miri |
+| `--full` | Strict hosted-CI parity: requires all local tools, full Miri, fresh RISC-V clippy, Lean |
+| `--miri` | Enable Miri explicitly |
+| `--no-qemu` | Skip QEMU smoke tests |
+| `--output DIR` | Where logs, manifest and TSV go |
+
+Env var `AUDIT_QEMU_TIMEOUT` (default 90 s) bounds each QEMU run. The script runs all selected steps, writes `results.tsv`, `manifest.txt`, `summary.json`, per-step logs and artifact hashes, and exits non-zero if any required step fails.
+
+Steps are split across `scripts/verify/gates/`:
+
+| File | Content |
+|------|---------|
+| `core.sh` | Format, unsafe ledger, inventory, boundary and generated-docs checks, doc links, product naming, benchmark provenance, command smoke (includes the `analyze-v03.py --self-test` check), Python tooling tests, many static source-structure assertions, loom models, rustc-compiled policy test harnesses, focused host tests, fault-injection tests, `kernel_bpf` cloud and embedded tests, x86_64 and AArch64 kernel `cargo check` |
+| `required.sh` | Non-quick extras: per-crate clippy, rk_bridge and rk_cli clippy and tests, Shrike firmware host tests and clippy, FPGA safety gate, RISC-V clippy in full mode |
+| `extended.sh` | Release-mode tests and `lake build` |
+| `miri.sh` | `cargo miri setup`, Miri per crate (full) and `kernel_bpf` cloud |
+
+The QEMU stages (`qemu-release-smoke`, `qemu-smp1-smoke`, `qemu-smp4-scheduler-smoke`, `qemu-production-signed-smoke`) live in the main script. The FPGA step compiles and runs the SystemVerilog testbench for the Shrike safety gate with Icarus Verilog; `release-verification.md` says that proves the RTL truth table only.
+
+## Verify scripts
+
+| Script | Role |
+|--------|------|
+| `abi-surface.py` | ABI catalogue consistency |
+| `error-policy.py`, `execve-typed-error.py` | Error handling policy |
+| `unsafe-ledger.py` | Unsafe-code ledger |
+| `target-boundary.py` | Target boundaries |
+| `artifact-provenance.py`, `benchmark-provenance.py` | Evidence provenance |
+| `doc-links.py`, `product-naming.py` | Documentation hygiene |
+| `command-smoke.py` | Runs the `commands.toml` entries |
+| `quality.py` | Coverage and mutation evidence boundary |
+| `fpga-safety-gate.sh` | RTL testbench |
+
+## GitHub Actions
+
+Workflows exist in `.github/workflows/`.
+
+| Workflow | Triggers | Jobs |
+|----------|----------|------|
+| `build.yml` ("Rust") | Push (ignoring docs-only paths), pull request, manual, weekly Monday 05:00 UTC | lint (fmt, unsafe ledger, inventory and docs checks, per-crate clippy), standalone-workspace lint and test, FPGA safety gate, RP2040 firmware, Miri, `kernel_bpf` Miri, build and upload ISO artifact, QEMU kernel smoke |
+| `bpf-profiles.yml` | `kernel_bpf` changes | Cloud and embedded profile build, test and clippy; profile mutual exclusion; semantic consistency; format check |
+| `fuzz.yml` | `kernel_bpf`, ELF loader, syscall, `rk_bridge` changes, weekly Sunday, manual | See [Tests](/axiomos/v0.5.0-alpha.3/testing/tests) |
+
+All jobs pin `nightly-2026-07-02`. `build` depends on `test`, standalone tests, firmware, and both Miri jobs. The `qemu-kernel-smoke` job builds with a public RFC 8032 test public key as a CI fixture trust root; it is not a secret or a production trust root.
+
+<Callout type="info">
+`docs/operations/release-verification.md` says the local full profile is the required release-oriented gate and that the `v0.5.0-alpha.1` tag does not claim hosted CI, physical robot HIL, a ForgeFPGA bitstream or the v0.5 behavior registry deliverables. Workflow files exist, but treat the local gate as the authority.
+</Callout>
+
+## Release verification
+
+```bash
+cargo xtask check all --profile full
+cargo xtask check all --profile full --format json
+```
+
+The full profile covers build, test, static policy, target, fuzz-build, Miri and QEMU checks. Physical HIL and independent review remain separate evidence and must not be inferred from a local pass.

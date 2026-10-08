@@ -1,0 +1,168 @@
+import { Callout, Steps, Tabs } from 'nextra/components'
+
+# Getting started
+
+**Relevant source files**
+
+- [Cargo.toml](https://github.com/volnlabs/rbpf/blob/main/Cargo.toml)
+- [README.md](https://github.com/volnlabs/rbpf/blob/main/README.md)
+- [src/lib.rs](https://github.com/volnlabs/rbpf/blob/main/src/lib.rs)
+- [examples/date.rs](https://github.com/volnlabs/rbpf/blob/main/examples/date.rs)
+
+## Adding the dependency
+
+<Tabs items={['volnlabs fork (git)', 'crates.io (upstream)', 'Local path']}>
+  <Tabs.Tab>
+
+```toml
+[dependencies]
+rbpf = { git = "https://github.com/volnlabs/rbpf", branch = "main" }
+```
+
+  </Tabs.Tab>
+  <Tabs.Tab>
+
+```toml
+[dependencies]
+rbpf = "0.4.1"
+```
+The crates.io release is upstream rbpf and does **not** include the `aarch64-jit` feature or the fork's interpreter fixes.
+
+  </Tabs.Tab>
+  <Tabs.Tab>
+
+```toml
+[dependencies]
+rbpf = { path = "path/to/rbpf" }
+```
+
+  </Tabs.Tab>
+</Tabs>
+
+## Cargo features
+
+| Feature | Default | Pulls in | Effect |
+|---|---|---|---|
+| `std` | yes | `libc`, `combine/std` | Standard library. Enables the `std`-only helpers (`bpf_trace_printf`, `bpf_time_getns`, `sqrti`, `rand`) and lets the x86_64 JIT allocate its own executable memory. |
+| `aarch64-jit` | no | nothing | Exposes `rbpf::aarch64`. Works with or without `std` and adds no dependencies. |
+| `cranelift` | no | `cranelift-codegen`, `-frontend`, `-jit`, `-native`, `-module` (0.127) | Adds `cranelift_compile()` / `execute_program_cranelift()` to every VM wrapper. |
+
+Dependencies that are always present: `byteorder`, `log`, `combine` (parser combinators for the assembler) and `hashbrown`. They are built with `default-features = false` so `no_std` builds do not pull in `std`.
+
+### `no_std`
+
+```toml
+[dependencies]
+rbpf = { git = "https://github.com/volnlabs/rbpf", default-features = false }
+```
+
+Without `std`:
+
+- The crate is `#![no_std]` and uses `alloc` (`Vec`, `Box`, `String`, `BTreeMap`) and `hashbrown`.
+- `Error`/`ErrorKind` come from `src/no_std_error.rs` instead of `std::io`.
+- The x86_64 JIT requires caller-supplied executable memory through `set_jit_exec_memory()`. That buffer must be page-aligned and at least as large as the page-rounded code size (see [x86_64 JIT](/rbpf/vms/x86-64-jit)).
+- The assembler still works, but with less descriptive parse errors.
+- `disassembler::disassemble()` logs with `log::info!` instead of printing.
+
+## Platform support
+
+| Engine | Compiles on | Executes on |
+|---|---|---|
+| Interpreter | all targets | all targets |
+| x86_64 JIT | `target_arch = "x86_64"` and not Windows | same |
+| Cranelift JIT | hosts supported by `cranelift-native` | same |
+| AArch64 compiler | any host (encoding only) | little-endian AArch64, after the embedder makes the code executable |
+
+## A first program
+
+<Steps>
+
+### Build or load bytecode
+
+eBPF instructions are 8 bytes each. The bytes can be written by hand, produced by the [assembler](/rbpf/assembler), or extracted from an ELF section (see [Examples](/rbpf/examples)).
+
+### Create a VM
+
+The VM wrapper decides what the program receives in `r1`. `EbpfVmNoData` passes nothing. The constructor takes `Option<&[u8]>` and runs the verifier immediately.
+
+### Register helpers (optional)
+
+`register_helper(key, fn)` where `fn` is a `fn(u64, u64, u64, u64, u64) -> u64`.
+
+### Execute
+
+Call `execute_program()` for the interpreter. On x86_64 you can instead call `jit_compile()` and then `unsafe { execute_program_jit() }`.
+
+</Steps>
+
+```rust
+fn main() {
+    let prog = &[
+        0xb4, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // mov32 r0, 0
+        0xb4, 0x01, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, // mov32 r1, 2
+        0x04, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, // add32 r0, 1
+        0x0c, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // add32 r0, r1
+        0x95, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // exit
+    ];
+
+    let vm = rbpf::EbpfVmNoData::new(Some(prog)).unwrap();
+    assert_eq!(vm.execute_program().unwrap(), 0x3);
+}
+```
+
+### With the x86_64 JIT on packet data
+
+```rust
+let prog = &[
+    0x71, 0x10, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, // ldxb r0, [r1+2]
+    0x95, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // exit
+];
+let mem = &mut [0xaa, 0xbb, 0x11, 0xcc, 0xdd];
+
+let mut vm = rbpf::EbpfVmRaw::new(Some(prog)).unwrap();
+
+#[cfg(all(target_arch = "x86_64", not(windows), feature = "std"))]
+{
+    vm.jit_compile().unwrap();
+    unsafe { assert_eq!(vm.execute_program_jit(mem).unwrap(), 0x11) };
+}
+#[cfg(not(all(target_arch = "x86_64", not(windows), feature = "std")))]
+assert_eq!(vm.execute_program(mem).unwrap(), 0x11);
+```
+
+<Callout type="warning">
+JIT-compiled code from the x86_64 backend performs **no runtime memory checks**. A program that reads or writes out of bounds can crash the host process, which is why `execute_program_jit` is `unsafe`. Test programs with the interpreter first.
+</Callout>
+
+### Compiling for AArch64
+
+```rust
+use rbpf::aarch64::{Aarch64Compiler, CompileOptions};
+
+// mov r0, 42; exit
+let program = [0xb7, 0, 0, 0, 42, 0, 0, 0, 0x95, 0, 0, 0, 0, 0, 0, 0];
+let mut offsets = [0u32; 2];
+let compiler = Aarch64Compiler::new(
+    &program,
+    CompileOptions { max_instructions: 2, max_code_size: 1024, stack_size: 512 },
+    &mut offsets,
+)
+.unwrap();
+let mut output = [0u8; 1024];
+let info = compiler.emit_into(&mut output).unwrap();
+assert_eq!(info.code_len, compiler.code_len());
+// `output` now holds machine code; it is NOT executable yet.
+```
+
+To actually run the output, see [AArch64 JIT](/rbpf/aarch64-jit) and the [invocation ABI](/rbpf/aarch64-jit/abi).
+
+## Useful commands
+
+```sh
+cargo test                                   # default features (std)
+cargo test --all-features                    # + cranelift + aarch64-jit
+cargo test --features aarch64-jit --test aarch64_jit
+cargo check --lib --target aarch64-unknown-none \
+  --no-default-features --features aarch64-jit   # bare-metal compiler check
+cargo run --example disassemble
+```

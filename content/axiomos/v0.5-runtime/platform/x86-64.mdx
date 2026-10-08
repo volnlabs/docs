@@ -1,0 +1,132 @@
+import { Callout } from 'nextra/components'
+
+# x86-64
+
+<details>
+<summary>Relevant source files</summary>
+
+- [kernel/src/limine.rs](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/kernel/src/limine.rs)
+- [limine.conf](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/limine.conf)
+- [kernel/linker-x86_64.ld](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/kernel/linker-x86_64.ld)
+- [kernel/src/arch/gdt.rs](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/kernel/src/arch/gdt.rs)
+- [kernel/src/arch/idt.rs](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/kernel/src/arch/idt.rs)
+- [kernel/src/arch/x86_64.rs](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/kernel/src/arch/x86_64.rs)
+- [kernel/src/acpi.rs](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/kernel/src/acpi.rs)
+- [kernel/src/acpi/mapping.rs](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/kernel/src/acpi/mapping.rs)
+- [kernel/src/apic.rs](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/kernel/src/apic.rs)
+- [kernel/src/hpet.rs](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/kernel/src/hpet.rs)
+- [kernel/src/sse.rs](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/kernel/src/sse.rs)
+- [kernel/src/mcore/mod.rs](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/kernel/src/mcore/mod.rs)
+- [kernel/src/mcore/lapic.rs](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/kernel/src/mcore/lapic.rs)
+- [kernel/src/main.rs](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/kernel/src/main.rs)
+
+</details>
+
+x86_64 is the "cloud profile" target and, per ADR-0003, the only target in the fully **Supported** tier. Its release evidence is a build, strict lint, host suites, a signed production boot, unsigned-image negative tests and SMP QEMU integration tests. The documented run path is QEMU with OVMF firmware ([`boot.md`](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/docs/operations/boot.md)); this repository does not document physical x86 hardware validation.
+
+## Boot via Limine
+
+The kernel boots with the [Limine](https://github.com/limine-bootloader/limine) protocol. [`limine.conf`](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/limine.conf) is minimal:
+
+```text
+timeout: 0
+serial: no
+verbose: no
+
+/axiomos
+    protocol: limine
+    kernel_path: boot():/boot/kernel
+```
+
+`build.rs` assembles the kernel, root filesystem and a Limine ISO, and fetches prebuilt OVMF firmware for QEMU.
+
+The linker script ([`linker-x86_64.ld`](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/kernel/linker-x86_64.ld)) uses `kernel_main` as entry and links at `0xffffffff80000000`, the top 2 GiB, as the Limine specification requires.
+
+[`limine.rs`](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/kernel/src/limine.rs) places request statics in the `.requests` section between start and end markers, using base revision 3:
+
+| Request | Purpose in this kernel |
+|---|---|
+| `BaseRevision` (3) | Checked at the top of `main`; the kernel halts with a `BOOT_FATAL` code if unsupported |
+| `DateAtBootRequest` | Wall-clock boot time (`init_boot_time`) |
+| `ExecutableFileRequest`, `ExecutableAddressRequest` | Kernel image file and load address |
+| `MemoryMapRequest`, `HhdmRequest` | Physical memory map and higher-half direct map |
+| `RsdpRequest` | ACPI RSDP address |
+| `StackSizeRequest` | 262144 bytes (256 KiB) boot stack |
+| `ModuleRequest` | Boot modules |
+| `MpRequest` | Multiprocessor info; used to start application processors |
+
+On a fatal boot error the x86 `main` prints `BOOT_FATAL code=N` to the serial port and halts. After `kernel::init`, it mounts an ext2 root from block device 0, opens `/bin/init`, creates the init process and prints `QEMU_BOOT_OK`, which the CI smoke test greps for.
+
+## Initialization order
+
+In `kernel::init` the x86_64 hardware steps run in this order:
+
+```mermaid
+flowchart LR
+  A["mem::init"] --> B["acpi::init"]
+  B --> C["apic::init (IOAPIC, 8259 off)"]
+  C --> D["hpet::init"]
+  D --> E["BPF, VFS, IIO"]
+  E --> F["mcore::init (per-CPU GDT, IDT, LAPIC, SSE)"]
+  F --> G["pci::init"]
+```
+
+## GDT and TSS
+
+[`gdt.rs`](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/kernel/src/arch/gdt.rs) builds a GDT per CPU with kernel code, kernel data, a TSS, user code and user data (user selectors have RPL 3). Each TSS has:
+
+| Stack | Index / slot | Size |
+|---|---|---|
+| Double-fault IST | IST 0 | 5 pages (20 KiB) |
+| Page-fault IST | IST 1 | 5 pages (20 KiB) |
+| Privilege-level-0 stack (`RSP0`) | `privilege_stack_table[0]` | 64 pages (256 KiB) |
+
+Stacks are heap-allocated and leaked. The scheduler updates `RSP0` on context switches through a mutable alias of the TSS, which the source documents as a deliberate aliasing workaround.
+
+## IDT and vectors
+
+[`idt.rs`](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/kernel/src/arch/idt.rs) sets handlers for debug, breakpoint, device-not-available, general protection, invalid opcode, invalid TSS, segment not present, stack segment, double fault (on IST 0) and page fault (on IST 1). Named interrupt vectors:
+
+| Vector | Name | Use |
+|---|---|---|
+| `0x20` (32) | `Timer` | LAPIC timer tick |
+| `0x31` (49) | `LapicErr` | LAPIC error |
+| `0x32` (50) | `TlbShootdown` | Cross-CPU TLB shootdown IPI |
+| `0x80` | `Syscall` | Syscall gate, DPL 3, interrupts disabled on entry, naked assembly wrapper that builds a `GPRegisters` frame |
+| `0xff` (255) | `Spurious` | LAPIC spurious vector |
+
+Syscalls on x86_64 use the `0x80` interrupt gate in this code; no `syscall`/`sysret` MSR setup appears in the files reviewed for this page.
+
+## ACPI
+
+[`acpi.rs`](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/kernel/src/acpi.rs) reads the RSDP address from the Limine `RsdpRequest` and builds the `acpi` crate's `AcpiTables` behind a `Mutex`. Its `AcpiHandler` maps each requested physical range into a reserved higher-half segment, page by page. Page-count and offset arithmetic is isolated in `acpi/mapping.rs` with overflow checks (`plan_mapping`), and any prior bootloader mappings in the reserved range are unmapped first. ACPI is used for the interrupt model (IOAPIC) and the HPET table. It is not used for shutdown: `arch::x86_64::shutdown` writes to QEMU's debug-exit port `0xf4`.
+
+## APIC, IOAPIC and the legacy PIC
+
+- **8259 PIC:** `apic::init` first remaps and then masks both legacy PICs.
+- **IOAPIC:** The interrupt model must be APIC, and the code asserts **exactly one IOAPIC** ("only exactly one IOAPIC is supported for now"). Its register page is mapped uncached and non-executable into the higher half. `mcore::init_interrupts` calls `io_apic.init(32)` with vector offset 32, but the IRQ redirection code that would route device interrupts is commented out with a TODO. Device IRQ routing through the IOAPIC is therefore not wired in the reviewed code.
+- **LAPIC:** `mcore/lapic.rs` maps the xAPIC page per CPU and builds a `LocalApic` with the timer in periodic mode, initial count `312_500`, divide by 16, plus error and spurious vectors from the table above. IPIs go through `Lapic::send_ipi`, which uses the `x2apic` crate when x2APIC is enabled in `IA32_APIC_BASE` and a hand-written xAPIC ICR path otherwise (working around an unshifted destination in the dependency's xAPIC path).
+
+The resulting tick frequency depends on the LAPIC input clock and is not calibrated against a reference in the code reviewed here.
+
+## HPET
+
+[`hpet.rs`](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/kernel/src/hpet.rs) finds the HPET base address from the ACPI `HpetInfo` table, maps it uncached and non-executable, and sets the enable bit. It exposes the main counter and the counter clock period (femtoseconds) through a `RwLock`. It acts as the monotonic time source on x86_64; comparator timers are not used by the code shown.
+
+## SSE
+
+[`sse.rs`](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/kernel/src/sse.rs) uses `raw_cpuid` to **require** SSE, SSE2 and FXSAVE/FXRSTOR, panicking if any is missing. It then clears `CR0.EM`, sets `CR0.MP`, and sets `CR4.OSFXSR` and `CR4.OSXMMEXCPT_ENABLE`. It runs on every CPU. AVX/XSAVE state is not handled in this file.
+
+## SMP and TLB shootdown
+
+`mcore::init` writes the page-table root (`CR3`) into each Limine `Cpu.extra` field, initializes the run queues and sleep list, points each application processor's `goto_address` at `cpu_init_and_idle`, and runs `cpu_init_and_return` on the bootstrap processor. Each CPU loads `CR3`, builds and loads its own GDT/TSS and IDT, initializes its LAPIC, stores an `ExecutionContext` in `KernelGsBase`, runs `sse::init`, marks itself online and enables interrupts.
+
+TLB shootdown (`arch/x86_64.rs`) uses an epoch counter and per-CPU acknowledgement array (up to 64 tracked CPUs): the sender bumps the epoch, flushes locally, sends vector `0x32` IPIs to the target LAPIC IDs, and spins until every target has acknowledged the epoch. While spinning it also acknowledges other senders' epochs, which breaks mutual-wait deadlocks when interrupts were masked on entry.
+
+<Callout type="info">
+  The README's limitations list a single global run queue shared by all CPUs, no copy-on-write fork on x86_64 (full page copy), and that new multi-core real-time claims need the per-CPU run-queue work tracked in issue 57.
+</Callout>
+
+## Serial console
+
+x86_64 `serial_print` writes to COM1 (port `0x3F8`) through the `uart_16550` crate with interrupts disabled around each write. See [Drivers](/axiomos/v0.5-runtime/platform/drivers).

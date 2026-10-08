@@ -1,0 +1,41 @@
+import { Callout } from 'nextra/components'
+
+# Security
+
+**Relevant source files**
+
+- [SECURITY.md](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/SECURITY.md)
+- [docs/security/README.md](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/docs/security/README.md)
+- [docs/security/threat-model.md](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/docs/security/threat-model.md)
+- [docs/security/bpf-trust.md](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/docs/security/bpf-trust.md)
+- [docs/security/verifier-assurance.md](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/docs/security/verifier-assurance.md)
+- [docs/security/unsafe-code/ledger.md](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/docs/security/unsafe-code/ledger.md)
+- [docs/security/gates/local-audit-gate.md](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/docs/security/gates/local-audit-gate.md)
+- [docs/security/audit-runtime-findings.md](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/docs/security/audit-runtime-findings.md)
+
+axiomos positions itself in the **engineering-safety** class: a memory-safe implementation language, a load-bearing static verifier with zero `unsafe`, WCET admission control, an inventoried unsafe surface and a growing test corpus, but **no** machine-checked proofs of the kernel, no verified scheduler, and no external audit yet ([SECURITY.md](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/SECURITY.md)).
+
+## Section map
+
+| Page | Covers |
+|---|---|
+| [Threat Model](/axiomos/v0.5.0-alpha.3/security/threat-model) | Assets, adversary classes, trust boundaries, mitigation map, open gaps, TCB size and seL4 comparison |
+| [Verifier Assurance](/axiomos/v0.5.0-alpha.3/security/verifier-assurance) | Bounded verifiable fragment, state-count bound, static WCET model, admission |
+| [Unsafe-Code Audit](/axiomos/v0.5.0-alpha.3/security/unsafe-code) | The unsafe ledger: 675 sites classified into owned obligations |
+| [Audit Gate & Findings](/axiomos/v0.5.0-alpha.3/security/audit-findings) | `cargo xtask check all` gate contents, QEMU markers, runtime findings |
+| [BPF Trust Model](/axiomos/v0.5.0-alpha.3/bpf/trust-model) | Signing, capabilities, handles, quotas, reclamation (in the eBPF section) |
+
+## Security bug priorities
+
+Per [SECURITY.md](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/SECURITY.md), in rough priority order:
+
+1. **Verifier soundness:** a program that passes verification but reads/writes outside verified regions, overflows the stack, exceeds its execution bound, or bypasses a helper argument contract.
+2. **Syscall boundary:** userspace input that corrupts kernel state through `sys_bpf` or any other syscall.
+3. **Isolation:** a BPF program observing or modifying another program's or the kernel's state outside the helper API.
+4. **Denial of service from unprivileged input** (verifier state explosion, unbounded admission).
+
+Out of scope today: speculative-execution side channels (#89) and physical attacks (JTAG, SD-card swap). Reports go to the address in SECURITY.md with subject `[axiomos-security]`, or via GitHub private vulnerability reporting.
+
+<Callout type="warning">
+Several security documents were written at different points in an ongoing audit remediation and partly disagree. In particular, SECURITY.md and the threat model still say signature enforcement is off by default, while the normative [BPF trust policy](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/docs/security/bpf-trust.md) and `kernel/src/bpf/trust.rs` make non-test builds without `bpf-unsigned-development` **signed-only**. Following the repository's own authority order, this wiki treats the normative trust policy and code as current.
+</Callout>

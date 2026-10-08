@@ -1,0 +1,34 @@
+.branch-switcher {
+  padding: 4px 8px;
+  border: 1px solid rgb(0 0 0 / 0.2);
+  border-radius: 6px;
+  font-size: 14px;
+  color: #111;
+  background: #fff;
+  color-scheme: light;
+}
+.dark .branch-switcher {
+  color: #eee;
+  background: #111;
+  border-color: rgb(255 255 255 / 0.2);
+  color-scheme: dark;
+}
+/* native popup: keep option text readable in both themes */
+.branch-switcher option { color: #111; background: #fff; }
+.dark .branch-switcher option { color: #eee; background: #111; }
+
+/* quieter callouts: neutral body, coloured left bar + icon only */
+.nextra-callout {
+  --accent: #6b7280;
+  background: rgb(0 0 0 / 0.03) !important;
+  color: inherit !important;
+  border: 0 !important;
+  border-left: 3px solid var(--accent) !important;
+  border-radius: 4px !important;
+}
+.dark .nextra-callout { background: rgb(255 255 255 / 0.04) !important; }
+.nextra-callout[class*="yellow"] { --accent: #d97706; }
+.nextra-callout[class*="blue"] { --accent: #3b82f6; }
+.nextra-callout[class*="red"] { --accent: #dc2626; }
+.nextra-callout[class*="green"] { --accent: #16a34a; }
+.nextra-callout > div:first-child { color: var(--accent); }

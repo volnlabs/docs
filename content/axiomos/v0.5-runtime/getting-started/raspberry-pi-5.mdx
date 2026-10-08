@@ -1,0 +1,146 @@
+import { Callout, Steps } from 'nextra/components'
+
+# Raspberry Pi 5
+
+Relevant source files
+
+- [scripts/build/rpi5.sh](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/scripts/build/rpi5.sh)
+- [scripts/deploy/rpi5.sh](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/scripts/deploy/rpi5.sh)
+- [kernel/Cargo.toml](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/kernel/Cargo.toml)
+- [docs/operations/hardware-validation-and-benchmarking.md](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/docs/operations/hardware-validation-and-benchmarking.md)
+- [docs/operations/boot.md](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/docs/operations/boot.md)
+- [firmware/shrike/rp2040/build-uf2.sh](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/firmware/shrike/rp2040/build-uf2.sh)
+- [userspace/tools/rk_cli/src/commands/runtime.rs](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/userspace/tools/rk_cli/src/commands/runtime.rs)
+- [docs/reference/generated/artifacts.md](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/docs/reference/generated/artifacts.md)
+
+The Raspberry Pi 5 is the primary hardware target. The kernel is built as a raw `kernel8.img` with the ext2 root filesystem embedded via `include_bytes!`, and placed on the FAT32 boot partition of an SD card.
+
+<Callout type="warning">
+Pi 5 testing is manual; there is no hardware-in-the-loop CI. The target manifest labels the Pi 5 `supported after HIL`. Treat QEMU results as preflight evidence only.
+</Callout>
+
+## Build
+
+<Steps>
+
+### Provide the trust key
+
+The kernel embeds the production Ed25519 public key. The script refuses to generate a substitute.
+
+```bash
+export AXIOM_BPF_TRUSTED_KEY_PATH=/secure/path/axiomos-ed25519.pub
+test "$(wc -c < "$AXIOM_BPF_TRUSTED_KEY_PATH")" -eq 32
+```
+
+### Build
+
+```bash
+cargo xtask build rpi5 -- release embedded-rpi5
+```
+
+The script takes two positional arguments after `--`: the profile (`release` or `debug`, default `release`) and the kernel feature list (default `embedded-rpi5`). Use `--dry-run` before `--` to print the delegated command.
+
+### Check outputs
+
+Everything lands under `target/aarch64-unknown-none/release/` (or `debug`, or under `CARGO_TARGET_DIR` if set):
+
+| File | Contents |
+|------|----------|
+| `kernel` | Kernel ELF |
+| `kernel8.img` | Raw binary made with `llvm-objcopy -O binary` (or `rust-objcopy`) |
+| `rpi5-artifacts.sha256` | SHA-256 of the ELF, `kernel8.img`, rootfs image and the trust key file |
+
+</Steps>
+
+What `scripts/build/rpi5.sh` does internally:
+
+1. Installs the `aarch64-unknown-none` target if missing.
+2. Builds the root package with `--no-default-features --features aarch64_deps` to produce the rootfs, and reads `DISK_IMAGE` from a unique `AXIOM_ARTIFACT_PATHS` file.
+3. Exports `AXIOM_DISK_IMAGE` and builds `-p kernel` with the requested features.
+4. Converts the ELF to `kernel8.img` and writes the hash manifest.
+
+### Managed-runtime image
+
+To build the managed runtime, add `managed-runtime` to the kernel feature list:
+
+```bash
+AXIOM_BPF_TRUSTED_KEY_PATH=/secure/path/axiomos-ed25519.pub \
+  bash scripts/build/rpi5.sh release embedded-rpi5,managed-runtime
+```
+
+`scripts/build/rpi5.sh` inspects the feature list: if it contains `managed-runtime` or `managed-runtime-bench-markers`, it adds `managed-runtime-aarch64` to the root image build features, which enables the managed `init` and installer in the rootfs. The image then boots straight into the installer (see [Installer](/axiomos/v0.5-runtime/runtime/installer)) rather than the legacy probes.
+
+After boot, administer it from a host over the debug UART (115200 baud) with `rk runtime`; see [Tools](/axiomos/v0.5-runtime/userspace/tools):
+
+```bash
+rk bundle --input controller.bin --output controller.axmb --key signing-key.pk8 \
+  --behavior-id 00000000000000000000000000000001 --revision 1 --motor-pair
+rk runtime --port /dev/ttyACM0 upload controller.axmb
+rk runtime --port /dev/ttyACM0 query
+```
+
+<Callout type="warning">
+This configuration is software and host tested only. Physical qualification has not been run and actuation is disabled. Do not treat a successful boot or upload as hardware evidence. See [Qualification](/axiomos/v0.5-runtime/runtime/qualification).
+</Callout>
+
+The Shrike RP2040 side of the link uses the runtime UF2 from `firmware/shrike/rp2040/build-uf2.sh --runtime` (see [Building](/axiomos/v0.5-runtime/getting-started/building)).
+
+### Instrumented images
+
+Build instrumented images separately and never ship them as production, as the hardware runbook specifies:
+
+```bash
+cargo xtask build rpi5 -- release embedded-rpi5,verifier-cost   # verifier-cost calibration
+cargo xtask build rpi5 -- release embedded-rpi5,bench           # GPIO-to-actuation timing
+```
+
+The qualification-only `managed-runtime-bench-markers` feature (implies `managed-runtime`) drives GPIO12 for each timer release and GPIO13 just before the recorder append, so an analyzer can measure them. Other feature names in `kernel/Cargo.toml` used by the HIL scripts are `bench-reflex-rearm`, `bench-estop-rearm`, `bench-pwm`, `bench-pwm-containment` and `trace-control-link`. See [Hardware-in-the-loop](/axiomos/v0.5-runtime/testing/hardware-in-the-loop).
+
+## Deploy
+
+Inspect first, then write to the mounted boot partition (not the host root filesystem):
+
+```bash
+cargo xtask deploy rpi5 --dry-run -- /path/to/mounted/pi-boot
+cargo xtask deploy rpi5 -- /path/to/mounted/pi-boot
+sync
+```
+
+The deploy script takes the mount point and an optional `debug` or `release` profile. It then:
+
+1. Checks that `kernel8.img` and `rpi5-artifacts.sha256` exist.
+2. Runs `sha256sum -c` against the manifest.
+3. Copies `kernel8.img` and the manifest (as `axiomos-rpi5-artifacts.sha256`) to the card.
+4. Creates `config.txt` only if one does not already exist.
+
+The generated `config.txt` contains:
+
+| Setting | Why |
+|---------|-----|
+| `arm_64bit=1`, `kernel=kernel8.img` | 64-bit boot of the kernel image |
+| `pciex4_reset=0` | Keep RP1 peripherals initialized without a PCIe driver |
+| `enable_rp1_uart=1` | Bare-metal UART0 at 115200 baud through RP1 |
+| `enable_uart=1`, `uart_2ndstage=1` | UART output and early debug output |
+| `disable_splash=1`, `gpu_mem=16` | Faster boot, minimal GPU memory |
+| `dtoverlay=disable-bt` | Bluetooth otherwise uses the UART pins |
+
+<Callout type="info">
+Raspberry Pi boot firmware must already be on the SD card. This repository neither fetches nor pins it. Record its revision and hashes with any HIL evidence.
+</Callout>
+
+## Serial console
+
+Connect a UART debug probe, find a stable path under `/dev/serial/by-id/`, and capture at 115200 baud before applying power:
+
+```bash
+PORT=/dev/serial/by-id/<debug-probe-uart>
+sudo timeout 120s cat "$PORT" | tr -d '\r' | tee pi5-boot.log
+```
+
+The runbook's baseline checks look for `INIT_PROCESS_STARTED` and, on a production image, `SIGNED_BPF_LOAD_OK` from `signed_bpf_loader`. A managed-runtime image does not print `SIGNED_BPF_LOAD_OK`, because the loader is the installer and loads nothing at boot. The kernel prints `PI5_BOOT_OK` on the Pi path, and bench images print `PI5_BENCH_READY`. A bench image uses a bounded deferred console; `PI5_BENCH_LOG_LOSS` invalidates any serial-derived measurement.
+
+A wiring sheet for the Pi 5 UART is at `docs/operations/wiring/axiomos-test-01-pi5-uart-wiring.pdf`.
+
+## Known limitations
+
+From the README: user-mode page faults panic the kernel, no demand paging, no POSIX signals, a single global run queue, only GPIO/PWM/UART on RP1 (no I2C, SPI, CAN or Ethernet), and no hardware watchdog integration. See the repository README for the full list.

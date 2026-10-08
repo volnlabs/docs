@@ -1,0 +1,144 @@
+import { Callout, Cards } from 'nextra/components'
+
+# axiomOS Overview
+
+**Relevant source files**
+
+- [README.md](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/README.md)
+- [docs/architecture/system-overview.md](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/docs/architecture/system-overview.md)
+- [docs/decisions/0003-supported-targets.md](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/docs/decisions/0003-supported-targets.md)
+- [docs/reference/generated/components.md](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/docs/reference/generated/components.md)
+- [kernel/src/main.rs](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/kernel/src/main.rs)
+- [kernel/src/lib.rs](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/kernel/src/lib.rs)
+- [Cargo.toml](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/Cargo.toml)
+- [docs/plans/active/v0.5-bounded-runtime-evolution.md](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/docs/plans/active/v0.5-bounded-runtime-evolution.md)
+
+axiomos is a bare-metal, `no_std` Rust kernel whose behavior can be changed at runtime by loading **verified eBPF programs** onto kernel hooks (scheduler switch, syscalls, timers, GPIO, PWM, IIO). It targets robotics and embedded control, where reflashing firmware to change a control policy is slow and risky. This version of the wiki documents the **`feat/v0.5-runtime`** branch.
+
+<Callout type="info">
+**Branch `feat/v0.5-runtime` (unmerged).** 108 commits ahead of `main` (about 222 files, +50k lines). It implements the v0.5 **managed runtime**: post-boot upload of signed controllers, a single 100 Hz CPU0 control slot, MCU-acknowledged safe handoff, fresh-state rollback and a bounded audit recorder. Software and host/model tests for milestones M1 to M6 are complete; the physical qualification campaign (M7) has not run and physical actuation stays disabled. See [Changes from main](/axiomos/v0.5-runtime/changes-from-main).
+</Callout>
+
+<Callout type="warning">
+**Status: research kernel under active hardware bring-up on Raspberry Pi 5.** It is not production-ready. The only benchmark campaign that meets the repository's evidence contract is a host-side verifier benchmark; all Pi 5, QEMU and Linux comparison numbers are either provisional or historical. See [Performance](/axiomos/v0.5-runtime/performance).
+</Callout>
+
+## Why it exists
+
+Field-deployed robots need behavioral updates (new sensor fusion, modified control loops, updated safety policy). Linux has the eBPF mechanism but not hard real-time latency or a small footprint; an RTOS has the footprint but no safe runtime extension. axiomos combines a small monolithic Rust kernel with a load-time verifier so that untrusted, hot-swappable logic is a first-class kernel object with static safety and timing admission ([README](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/README.md), [threat model](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/docs/security/threat-model.md)).
+
+The three defining design choices:
+
+1. **Bare metal, monolithic.** No host OS or RTOS. Limine boots x86_64; AArch64 boots from firmware with a device tree.
+2. **Rust core, `no_std`, `panic=abort`.** Assembly is limited to boot stubs and exception vectors; every `unsafe` site is inventoried in an [unsafe ledger](/axiomos/v0.5-runtime/security/unsafe-code).
+3. **eBPF for runtime extension.** Programs are authenticated (Ed25519), verified (CFG, bounds, tnum, pruning, liveness, static WCET), admitted against a utilization budget, then executed by an interpreter when a hook fires.
+
+## What's new on this branch
+
+- **Managed runtime** ([overview](/axiomos/v0.5-runtime/runtime)): one exclusive control slot on Pi 5 CPU0 executing one signed, verified controller at an absolute 100 Hz release grid, outside ordinary hook fanout.
+- **AXMB managed bundles** ([page](/axiomos/v0.5-runtime/runtime/managed-bundles)): a canonical 224-byte-header signed bundle, a managed verifier entry with fixed local bindings and a capture-only wheel-pair helper (1009).
+- **Lifecycle** ([page](/axiomos/v0.5-runtime/runtime/lifecycle)): permanent preparation worker, bounded artifact/instance ownership (3 artifacts, 2 instances), activation, rollback, deactivation and retirement with exact resource refunds.
+- **Safe handoff and rearm** ([page](/axiomos/v0.5-runtime/runtime/handoff-and-rearm)): new `SafeBarrier`/`SafeAck`, `SessionOffer`/`SessionReady` and `Requalify`/`Prepared` control-link messages; 80 ms handoff timeout; explicit operator rearm.
+- **Post-boot administration** ([page](/axiomos/v0.5-runtime/runtime/installer)): 14 versioned `SYS_BPF` commands behind the new `BEHAVIOR_ADMIN` capability, a debug-UART installer and the `rk runtime` / `rk bundle` / `rk audit-decode` host commands.
+- **Audit recorder** ([page](/axiomos/v0.5-runtime/runtime/recorder)): a 2,048-record kernel window with explicit loss accounting and offline decoding.
+- **Hardening along the way:** stricter legacy ELF rejection, fallible bounded verifier budgets, a branch-join stack-depth fix, map-helper extent and aliasing fixes, IRQ-masked heap locking, explicit object owners, and real RP2040 UART/SPI/GPIO adapters with R0.4 FPGA integration.
+- **Embedded control period** is now 10 ms (100 Hz) instead of 1 ms (1 kHz); cost weights are labeled unqualified model values.
+
+## System at a glance
+
+```mermaid
+flowchart TB
+    U["Userspace: init, demos, bpf_loader, rk tools, managed installer"]
+    ABI["Versioned syscall / sys_bpf ABI v1 + managed cmds 256..269"]
+    K["Kernel owners: syscall, VFS, process, VM, scheduler"]
+    V["kernel_bpf verifier"]
+    R["Immutable ProgramRuntime + interpreter"]
+    M["Maps and ring buffers"]
+    A["Monitored actuation: GPIO, PWM, IIO"]
+    S["Shrike-link UART control frames"]
+    FW["RP2040 firmware control loop"]
+    FPGA["FPGA safety gate on motor PWM"]
+    U --> ABI --> K
+    K -->|"verified program"| V --> R
+    K -->|"event snapshots"| R
+    R --> M
+    R --> A
+    MS["Managed slot: 100 Hz CPU0 controller"]
+    K -->|"preparation worker"| MS
+    MS -->|"one pair per release, SafeBarrier handoff"| S
+    A --> S --> FW --> FPGA
+```
+
+See [System Overview](/axiomos/v0.5-runtime/architecture/system-overview) for the full ownership model.
+
+## Supported targets
+
+| Target | Status (ADR-0003) | Notes |
+|---|---|---|
+| x86_64 QEMU/OVMF | Supported, primary release-gate target | Limine (UEFI and BIOS ISO), APIC, HPET, VirtIO, SMP QEMU tests |
+| Raspberry Pi 5 (AArch64) | Supported after HIL | Primary hardware target; GIC, RP1 GPIO/UART/PWM, embedded ext2 rootfs in `kernel8.img` |
+| AArch64 `virt` | Experimental | Compile check only; no production claim |
+| RISC-V | Experimental standalone demo | Lives in `kernel/demos/riscv`, outside the main kernel, which rejects other architectures with `compile_error!` |
+| Shrike RP2040 firmware | Supported after HIL | `thumbv6m-none-eabi` control-loop firmware |
+
+## What works and what does not
+
+The implemented surface (per the README and confirmed in code): boot on x86_64 and AArch64, paging and per-process address spaces, APIC and GIC interrupts, preemptive scheduling with per-CPU run queues, a syscall ABI (31 dispatched syscalls), kernel heap, VFS with ext2 root and devfs, pipes, fork/exec/waitpid, the BPF verifier gating the load path, WCET admission, Ed25519 BPF signing, RP1 GPIO/UART/PWM on Pi 5, and VirtIO on x86_64/`virt`.
+
+### Honest limitations
+
+<Callout type="info">
+Some items in the README's limitations list are older than the code. Where they disagree, this wiki follows the normative architecture docs and the code on `feat/v0.5-runtime`; the discrepancies are called out below.
+</Callout>
+
+| Area | Limitation | Source |
+|---|---|---|
+| Memory | No demand paging or file-backed faults; user pages are populated eagerly | [memory.md](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/docs/architecture/memory.md) |
+| Memory | Per-frame ownership leak on `AddressSpace` drop and task-stack isolation FIXME tracked (#69, #70) | README |
+| Process | No POSIX signals (`kill`, `sigaction`); user faults terminate the task with an exit status instead of delivering a signal | [kernel/src/arch/idt.rs](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/kernel/src/arch/idt.rs) |
+| Scheduler | No reschedule IPI: a remote wakeup runs when the target CPU next reschedules | [ADR-0001](/axiomos/v0.5-runtime/decisions/adr-0001-scheduling-locking) |
+| Scheduler | No priority inheritance; EDF/WCET admission applies to BPF programs, not native tasks | README (#60, #61) |
+| BPF | Manager is behind one global `Mutex`; no Spectre mitigations; no BTF; cross-section subprogram linking unsupported | README (#58, #87, #89, #90) |
+| BPF | Admission assumes one nominal fire rate for every hook (100 Hz on this branch, 1 kHz on `main`) | [verifier-assurance.md](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/docs/security/verifier-assurance.md) |
+| BPF | Shipped profiles are interpreter-only; the AArch64 JIT is not enabled | [ADR-0004](/axiomos/v0.5-runtime/decisions/adr-0004-bpf-jit-policy) |
+| Drivers | No I2C, SPI, CAN, Ethernet, USB, or hardware watchdog integration | README |
+| Operations | No persistent crash dump, no A/B kernel slots, no hardware-in-the-loop CI (Pi 5 testing is manual) | README |
+| Managed runtime | Host/model evidence only: no physical handoff, timing, rearm or soak qualification; physical actuation disabled; recorder is RAM-only | [v0.5 contract](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/docs/plans/active/v0.5-bounded-runtime-evolution.md) |
+| Assurance | No machine-checked proofs beyond a Lean tnum proof-of-concept; no secure/measured boot | [threat-model.md](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/docs/security/threat-model.md) |
+
+Discrepancies between README limitations and current code:
+
+- **Signed BPF loading.** The README says unsigned loads are accepted by default. In code, a build without the `bpf-unsigned-development` feature embeds a production Ed25519 key and sets `allow_unsigned = false` ([kernel/src/bpf/trust.rs](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/kernel/src/bpf/trust.rs)); unsigned loading is an explicit development feature.
+- **Run queues.** The README mentions a single global run queue; the code uses per-CPU queues with bounded stealing ([kernel/crates/kernel_run_queue](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/kernel/crates/kernel_run_queue)).
+- **`sys_nanosleep`.** The README says it busy-spins; the code parks the task with a deadline and reschedules ([kernel/src/syscall/mod.rs](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/kernel/src/syscall/mod.rs)).
+- **User page faults.** The README says they panic the kernel; the x86_64 handler calls `terminate_current_task_on_user_exception` first and only panics for kernel-mode faults.
+- **Missing `/bin/init`.** Boot does not panic; it prints `BOOT_FATAL code=init-executable-missing` and halts ([kernel/src/main.rs](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/kernel/src/main.rs)).
+
+## Repository map
+
+| Path | Contents |
+|---|---|
+| `kernel/src/` | Privileged kernel binary: arch (x86_64, aarch64), `mcore` (tasks, processes, scheduler), `mem`, `syscall` (including `managed.rs` and `installer_io.rs`), `file` (VFS glue, ext2, devfs, pipes), `driver`, `bpf` (manager, helpers, trust, plus `managed`, `preparation`, `installation`, `control`, `recorder`), `actuation`, `watchdog` |
+| `kernel/crates/` | Host-testable kernel crates: `kernel_bpf`, `kernel_abi`, `kernel_syscall`, `kernel_vfs`, `kernel_devfs`, `kernel_device`, `kernel_pci`, `kernel_elfloader`, `kernel_physical_memory`, `kernel_virtual_memory`, `kernel_map_transaction`, `kernel_memapi`, `kernel_usermem`, `kernel_run_queue`, `kernel_time`, `shrike_link` |
+| `kernel/platform/rpi5/` | Raspberry Pi 5 boot configuration |
+| `kernel/demos/riscv/` | Isolated experimental RISC-V demo |
+| `userspace/` | `core` (init, minilib, file_structure), `demos`, `tools` (bpf_loader, signed_bpf_loader, rk_bridge, rk_cli, rk_uart_forwarder), `benchmarks` |
+| `src/main.rs`, `build.rs` | Host-side QEMU runner and image assembly (ISO, ext2 rootfs) |
+| `tools/xtask/` | Validation, docs generation, build/run front-end (`cargo xtask`) |
+| `scripts/` | build, run, deploy, debug, verify, HIL, and benchmark adapters (including the v0.5 host runner and reducers) |
+| `examples/bpf/managed/` | Managed C controller examples for `rk bundle` |
+| `ci/` | Component, target, artifact, command and quality manifests; gate profiles |
+| `firmware/shrike/` | RP2040 control firmware, host simulation, FPGA safety gate |
+| `formal/` | Lean 4 formalization of the tnum domain |
+| `docs/` | Architecture, decisions, security, performance, operations, generated reference |
+
+## Where to go next
+
+<Cards>
+  <Cards.Card title="Getting Started" href="/axiomos/v0.5-runtime/getting-started" />
+  <Cards.Card title="Changes from main" href="/axiomos/v0.5-runtime/changes-from-main" />
+  <Cards.Card title="Managed Runtime" href="/axiomos/v0.5-runtime/runtime" />
+  <Cards.Card title="Architecture" href="/axiomos/v0.5-runtime/architecture/system-overview" />
+  <Cards.Card title="eBPF Subsystem" href="/axiomos/v0.5-runtime/bpf" />
+  <Cards.Card title="Security" href="/axiomos/v0.5-runtime/security" />
+</Cards>

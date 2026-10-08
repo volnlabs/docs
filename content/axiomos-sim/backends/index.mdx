@@ -1,0 +1,45 @@
+# Adapter Contract
+
+**Relevant source files**
+
+- [backends/qemu/manifest.toml](https://github.com/volnlabs/voln-vp/blob/main/backends/qemu/manifest.toml)
+- [backends/renode/manifest.toml](https://github.com/volnlabs/voln-vp/blob/main/backends/renode/manifest.toml)
+- [cli/src/manifest.rs](https://github.com/volnlabs/voln-vp/blob/main/cli/src/manifest.rs)
+- [cli/src/backend.rs](https://github.com/volnlabs/voln-vp/blob/main/cli/src/backend.rs)
+- [docs/superpowers/specs/2026-07-14-voln-vp-design.md](https://github.com/volnlabs/voln-vp/blob/main/docs/superpowers/specs/2026-07-14-voln-vp-design.md)
+
+A backend is a self-describing directory under `backends/`. Directory discovery plus this contract is the entire extension mechanism; there is no plugin manager.
+
+## Contract
+
+| Element | Requirement |
+|---|---|
+| `backends/<name>/manifest.toml` | `name`, `verbs` (subset of `run`, `test`, `doctor`), `boards` (board names) |
+| `backends/<name>/adapters/<verb>.sh` | Executable entry point for every declared verb |
+| Exit codes | Simulator failure propagates; a missing semantic observation is a failure even if the emulator exits 0 |
+
+Unknown verbs fail TOML deserialization. `bench` parses but fails validation as reserved.
+
+The CLI spawns the adapter with only the trailing arguments; configuration such as inputs, timeouts, and architecture flows through the inherited environment (`AXIOMOS_*`, `VOLN_VP_*`).
+
+## Backends on `main`
+
+| Backend | Manifest | Boards | Adapter chain |
+|---|---|---|---|
+| [`qemu`](/axiomos-sim/backends/qemu) | `verbs = ["run", "test", "doctor"]` | `virt` | `run.sh` to `boards/virt/qemu/<arch>.sh` to `runner.py <arch> run`; `test.sh` to `runner.py <arch> test` |
+| [`renode`](/axiomos-sim/backends/renode) | `verbs = ["run", "test", "doctor"]` | `virt-pi5` | `test.sh` fixes the marker then `exec run.sh`; `run.sh` generates a wrapper `.resc` and runs Renode |
+
+## Shared adapter rules
+
+Both backends implement the same guarantees, verified by `backends/tests/test_adapters.py` with stand-in emulators:
+
+- Explicit prebuilt inputs only; no guessing and no builds. A fake `cargo` on `PATH` fails the suite if an adapter tries to build.
+- A fresh, uniquely named run directory under `VOLN_VP_ARTIFACT_DIR` (default `/tmp`) per invocation, printed as `Artifacts: <dir>`.
+- Input hashing (SHA-256) and emulator version capture.
+- A wall-clock timeout (`VOLN_VP_TIMEOUT`, default `90s`, exit 124 on expiry).
+- Process-group cleanup of the emulator and its helpers on success, failure, timeout, and SIGINT/SIGTERM.
+- PASS requires the required UART marker(s) and no observed panic or boot fatal. Failures print log tails.
+
+## Planned backends
+
+The spec reserves `gem5/` (manifest only, calibrated latency) and lists future slots such as a Gazebo bridge, Perfetto exporter, and VS Code extension. None exist on `main`.

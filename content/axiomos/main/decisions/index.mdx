@@ -1,0 +1,17 @@
+# Architecture Decisions
+
+**Relevant source files**
+
+- [docs/decisions/README.md](https://github.com/pro-utkarshM/axiomOS/blob/main/docs/decisions/README.md)
+- [docs/design/README.md](https://github.com/pro-utkarshM/axiomOS/blob/main/docs/design/README.md)
+
+ADRs record why major choices were made: status, context, decision, alternatives, consequences and supersession. An accepted ADR may name an implementation gap, but it is not an implementation manual or a substitute for the current architecture docs. In the repository's [authority order](/axiomos/main/architecture), accepted ADRs rank directly below the generated reference tables and above prose architecture docs.
+
+| ADR | Title | Status | Date | One-line summary |
+|---|---|---|---|---|
+| [0001](/axiomos/main/decisions/adr-0001-scheduling-locking) | Runtime scheduling, preemption, interrupts and lock ordering | Accepted with implementation gap (reschedule IPI pending) | 2026-07-14 | Per-CPU run queues, bounded stealing, generation-checked waits, strict lock ranks, no logging in hot paths |
+| [0002](/axiomos/main/decisions/adr-0002-error-policy) | Kernel error policy | Accepted | 2026-07-14 | Errors classified by boundary; typed errors only; publish after fallible preparation or roll back |
+| [0003](/axiomos/main/decisions/adr-0003-supported-targets) | Supported target and feature matrix | Accepted | 2026-07-14 | x86_64 QEMU supported; Pi 5 and RP2040 supported after HIL; `virt` and RISC-V experimental; signed-only production |
+| [0004](/axiomos/main/decisions/adr-0004-bpf-jit-policy) | BPF JIT policy | Accepted | 2026-07-14 | v1.0 is interpreter-only; any future JIT needs a superseding ADR meeting six conditions |
+
+Design documents follow a separate lifecycle under `docs/design/`: `active/` (under discussion or implementation), `accepted/` (reasoning retained after implementation), `rejected/`. On `main` all three contain only their README, so no design documents are currently open, accepted or rejected there.

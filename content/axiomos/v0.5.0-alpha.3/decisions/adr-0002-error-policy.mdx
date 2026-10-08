@@ -1,0 +1,44 @@
+# ADR-0002: Kernel Error Policy
+
+**Relevant source files**
+
+- [docs/decisions/0002-kernel-error-policy.md](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/docs/decisions/0002-kernel-error-policy.md)
+- [kernel/src/main.rs](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/kernel/src/main.rs)
+- [kernel/src/lib.rs](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/kernel/src/lib.rs)
+- [kernel/src/syscall/mod.rs](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/kernel/src/syscall/mod.rs)
+- [kernel/crates/kernel_abi/src/errno.rs](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/kernel/crates/kernel_abi/src/errno.rs)
+- [scripts/verify/error-policy.py](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/scripts/verify/error-policy.py)
+
+**Status:** Accepted. **Date:** 2026-07-14.
+
+## Decision
+
+Kernel failures are classified by boundary and handled consistently:
+
+| Class | Representation | Required behavior |
+|---|---|---|
+| Invalid userspace request | `Errno`, or a typed error mapped once to `Errno` | Return to the caller; never panic or log synchronously on a hot path |
+| Malformed untrusted input | Typed parser/validation error | Reject without partial publication or leaked ownership |
+| Resource exhaustion | Typed allocation/quota error | Roll back and return an error, or terminate only the affected task when no caller exists |
+| Would block | Typed readiness result | Register on a wait channel and retry after wake; preserve nonblocking semantics |
+| Recoverable device/filesystem error | Typed subsystem error | Propagate with context through adapters; never collapse to `()` |
+| Boot prerequisite failure | `BootError` | Emit one bounded fatal record and enter the architecture halt path |
+| Kernel invariant violation | Dedicated assertion/fatal path | Panic in debug/test; fail closed with a bounded diagnostic in release |
+
+Further rules:
+
+- Public subsystem traits must not use `Result` with a `()` or `&'static str` error type. Errors own stable machine-readable variants; human-readable formatting is not ABI.
+- Operations that acquire resources publish only after all fallible preparation succeeds, or carry a rollback guard that restores the old state on every error path (see [mapping transactions](/axiomos/v0.5.0-alpha.3/architecture/memory)).
+- Interrupt handlers cannot format errors: they bump bounded counters, store a compact trace record, move hardware to its safe state, and defer recovery to task context.
+
+## In the code
+
+- Boot uses a `BootError` enum with stable codes printed once as `BOOT_FATAL code=...` before halting; `kernel::init` returns a `thiserror`-derived `KernelInitError` ([Boot Flow](/axiomos/v0.5.0-alpha.3/architecture/boot-flow)).
+- Syscall dispatch functions return `Result` with `Errno`; user-copy failures stay `UserMemError` until the adapter maps them to `EFAULT`.
+
+## Enforcement
+
+- Clippy plus a repository check reject unit/string errors at designated public kernel boundaries.
+- `cargo xtask check error-policy` rejects `panic`/`unwrap`/`todo` and unit-error regressions in supported boot, filesystem-initialization and driver paths; rejects unit/string errors at low-level address, fork/exec and AArch64 paging/DTB boundaries; and enforces the bounded release fatal path and transactional block-device publication order.
+- Failure-injection tests cover every transactional allocation/mapping API.
+- Syscall adapters hold the only subsystem-error-to-`Errno` mapping tables.

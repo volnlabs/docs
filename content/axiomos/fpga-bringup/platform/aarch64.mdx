@@ -1,0 +1,168 @@
+import { Callout } from 'nextra/components'
+
+# AArch64
+
+<details>
+<summary>Relevant source files</summary>
+
+- [kernel/src/arch/aarch64/boot.S](https://github.com/pro-utkarshM/axiomOS/blob/feat/fpga-bringup/kernel/src/arch/aarch64/boot.S)
+- [kernel/src/arch/aarch64/boot.rs](https://github.com/pro-utkarshM/axiomOS/blob/feat/fpga-bringup/kernel/src/arch/aarch64/boot.rs)
+- [kernel/src/arch/aarch64/exception_vectors.S](https://github.com/pro-utkarshM/axiomOS/blob/feat/fpga-bringup/kernel/src/arch/aarch64/exception_vectors.S)
+- [kernel/src/arch/aarch64/exceptions.rs](https://github.com/pro-utkarshM/axiomOS/blob/feat/fpga-bringup/kernel/src/arch/aarch64/exceptions.rs)
+- [kernel/src/arch/aarch64/gic.rs](https://github.com/pro-utkarshM/axiomOS/blob/feat/fpga-bringup/kernel/src/arch/aarch64/gic.rs)
+- [kernel/src/arch/aarch64/interrupts.rs](https://github.com/pro-utkarshM/axiomOS/blob/feat/fpga-bringup/kernel/src/arch/aarch64/interrupts.rs)
+- [kernel/src/arch/aarch64/mm.rs](https://github.com/pro-utkarshM/axiomOS/blob/feat/fpga-bringup/kernel/src/arch/aarch64/mm.rs)
+- [kernel/src/arch/aarch64/paging.rs](https://github.com/pro-utkarshM/axiomOS/blob/feat/fpga-bringup/kernel/src/arch/aarch64/paging.rs)
+- [kernel/src/arch/aarch64/mem.rs](https://github.com/pro-utkarshM/axiomOS/blob/feat/fpga-bringup/kernel/src/arch/aarch64/mem.rs)
+- [kernel/src/arch/aarch64/cpu.rs](https://github.com/pro-utkarshM/axiomOS/blob/feat/fpga-bringup/kernel/src/arch/aarch64/cpu.rs)
+- [kernel/src/arch/aarch64/syscall.rs](https://github.com/pro-utkarshM/axiomOS/blob/feat/fpga-bringup/kernel/src/arch/aarch64/syscall.rs)
+- [kernel/src/arch/aarch64/shutdown.rs](https://github.com/pro-utkarshM/axiomOS/blob/feat/fpga-bringup/kernel/src/arch/aarch64/shutdown.rs)
+- [kernel/src/arch/aarch64/platform/virt/mod.rs](https://github.com/pro-utkarshM/axiomOS/blob/feat/fpga-bringup/kernel/src/arch/aarch64/platform/virt/mod.rs)
+- [kernel/src/arch/aarch64/platform/virt/mmio.rs](https://github.com/pro-utkarshM/axiomOS/blob/feat/fpga-bringup/kernel/src/arch/aarch64/platform/virt/mmio.rs)
+- [kernel/linker-aarch64.ld](https://github.com/pro-utkarshM/axiomOS/blob/feat/fpga-bringup/kernel/linker-aarch64.ld)
+- [kernel/linker-virt.ld](https://github.com/pro-utkarshM/axiomOS/blob/feat/fpga-bringup/kernel/linker-virt.ld)
+
+</details>
+
+The AArch64 port lives in `kernel/src/arch/aarch64/`. It is selected by `cfg(target_arch = "aarch64")` and, for full functionality, the `aarch64_arch` feature, which both board features (`rpi5` and `virt`) enable. The Raspberry Pi 5 is the primary hardware target; `virt` is an experimental QEMU board used for compile checks and development (ADR-0003). See [Raspberry Pi 5](/axiomos/fpga-bringup/platform/raspberry-pi-5) for board specifics.
+
+## Boot entry
+
+Unlike x86_64, AArch64 has no bootloader protocol layer in this repository. The firmware (on Pi 5, the Raspberry Pi boot firmware loading `kernel8.img`) jumps to `_start_asm` in [`boot.S`](https://github.com/pro-utkarshM/axiomOS/blob/feat/fpga-bringup/kernel/src/arch/aarch64/boot.S), which is the linker `ENTRY`. On entry `x0` holds the DTB physical address, the MMU is off, and the CPU may be at EL2 or EL1.
+
+`_start_asm` does the following:
+
+1. Saves the DTB address in `x19`.
+2. Parks every core whose `MPIDR_EL1` Aff0 byte is nonzero in a `wfe` loop. Only core 0 continues.
+3. If running at EL2, programs `HCR_EL2` (AArch64 for EL1), clears `CPTR_EL2`, enables EL1 access to the physical timer and counter via `CNTHCTL_EL2`, zeroes `CNTVOFF_EL2`, and executes `eret` into EL1h with all of DAIF masked.
+4. Sets the stack pointer to `__stack_top` (a 64 KiB `.bss.stack` region), clears `.bss`, enables FP/SIMD via `CPACR_EL1`, and installs `VBAR_EL1`.
+5. Calls the Rust `_start(dtb_addr)` in [`boot.rs`](https://github.com/pro-utkarshM/axiomOS/blob/feat/fpga-bringup/kernel/src/arch/aarch64/boot.rs).
+
+`_start` stores the DTB address, runs board init (`platform::rpi5::init()` or `platform::virt::init()`), parses the DTB (see [Device Tree](/axiomos/fpga-bringup/platform/device-tree)), and calls `kernel_main`. A DTB parse failure is logged and boot continues with a hardcoded fallback memory region.
+
+<Callout type="info">
+  Secondary cores are parked in assembly. In the files reviewed there is no PSCI `CPU_ON` or other code path that brings them up, so the AArch64 kernel runs on a single core today. `cpu.rs` defines `MAX_CPUS = 4` and a per-CPU `ExecutionContext` stored in `TPIDR_EL1`, and the IIO code sizes per-CPU slots for four CPUs, but that is structure, not SMP bring-up. The README also lists a single global run queue as a known limitation.
+</Callout>
+
+The `kernel_main` entry in [`main.rs`](https://github.com/pro-utkarshM/axiomOS/blob/feat/fpga-bringup/kernel/src/main.rs) calls `kernel::init()`, tries to mount the root and start init, and on `rpi5` spawns the Shrike control-link poller before going idle (see [Drivers](/axiomos/fpga-bringup/platform/drivers)).
+
+## Linker scripts and load addresses
+
+| Script | Load address | Used for |
+|---|---|---|
+| `kernel/linker-aarch64.ld` | `0x0008_0000` | Raspberry Pi 5: firmware loads `kernel8.img` at this physical address |
+| `kernel/linker-virt.ld` | `0x4008_0000` | QEMU `virt`: RAM starts at `0x4000_0000`; the offset leaves room for DTB and bootloader |
+
+Both scripts use `_start_asm` as entry, place `.text.boot` first, define three `PT_LOAD` segments (text, rodata, data), define `__bss_start`/`__bss_end`, and discard `.eh_frame` and notes. The Pi 5 script also defines `__kernel_end`.
+
+## Exception vectors
+
+`exception_vector_base` in [`exception_vectors.S`](https://github.com/pro-utkarshM/axiomOS/blob/feat/fpga-bringup/kernel/src/arch/aarch64/exception_vectors.S) is a 2 KiB-aligned table of 16 entries, each 128 bytes and containing a single branch to a handler placed outside the table. `exceptions::init_exception_vector` also writes `VBAR_EL1` from Rust during `Aarch64::early_init`.
+
+| Source | Sync | IRQ | FIQ | SError |
+|---|---|---|---|---|
+| Current EL, SP0 | invalid | invalid | invalid | invalid |
+| Current EL, SPx (kernel) | `handle_sync_exception` | `handle_irq` | invalid | invalid |
+| Lower EL, AArch64 (user) | `handle_sync_exception` | `handle_irq` | invalid | invalid |
+| Lower EL, AArch32 | invalid-exception call, then returns | invalid | invalid | invalid |
+
+"Invalid" handlers save context, call `handle_invalid_exception` with a kind and source code, and then loop on `wfi`.
+
+Each live handler uses `save_context`, which allocates a 288-byte frame holding `x0` to `x30`, `ELR_EL1`, `SPSR_EL1`, `SP_EL0` and a `vector_entry_timestamp` read from `CNTVCT_EL0` as early as possible. After the Rust handler returns, `check_preemption` runs and may call `reschedule` if the per-CPU reschedule flag is set, and then `restore_context` and `eret`. The vector-entry timestamp is later used to compute interrupt latency for the timer BPF hook. A dedicated 16 KiB `irq_stack` is defined in the same file.
+
+`handle_sync_exception` decodes `ESR_EL1.EC`:
+
+| EC | Meaning | Action |
+|---|---|---|
+| `0x15` | SVC from AArch64 | `syscall::handle_syscall`: syscall number in `x8`, arguments `x0` to `x5`, result in `x0`; the saved `SPSR` I-bit is cleared so EL0 returns with IRQs unmasked |
+| `0x20` | Instruction abort from lower EL | Kill the user task with status 139 |
+| `0x21` | Instruction abort, same EL | Kernel panic |
+| `0x24`, `0x25` | Data abort (lower / same EL) | `handle_data_abort` decodes the fault status code and returns a user-exception result |
+| other | Anything else | Lower-EL: kill with status 132. Kernel-mode: diagnostic halt or panic |
+
+The README's limitation list includes that user-mode page faults panic the kernel because there is no signal delivery. The exception code shown above does route lower-EL aborts through a "kill the task" result; treat the README list as the maintainers' authoritative statement of current behavior and re-check against the code if this matters to you.
+
+## Interrupt controller: GICv2 only
+
+[`gic.rs`](https://github.com/pro-utkarshM/axiomOS/blob/feat/fpga-bringup/kernel/src/arch/aarch64/gic.rs) implements the **GICv2** distributor (GICD) and CPU interface (GICC) using memory-mapped registers. There is no GICv3 redistributor or system-register (`ICC_*`) code in the file; its own header comment says the Pi 5 "likely" uses GICv2, and the platform memory map calls the Pi 5 controller a GIC-400. The top-level README's platform table says "GICv2/v3", which is broader than what the driver implements.
+
+Initialization (`gic::init`) is:
+
+1. Disable the distributor, read `GICD_TYPER` to find the number of IRQ lines.
+2. Clear-enable and clear-pending all interrupts.
+3. Place every interrupt in **Group 1** (the comment notes that on BCM2712 at non-secure EL1 Group 1 IRQs must be handled).
+4. Set all priorities to `0xFF` (lowest).
+5. Route every SPI to CPU 0 (target registers from index 8 upward).
+6. Configure all interrupts level-triggered, then enable the distributor for Groups 0 and 1 (`CTLR = 0b11`).
+7. On the CPU interface set the priority mask to `0xFF` and enable Groups 0 and 1.
+
+Other helpers: `enable_irq`, `disable_irq`, `set_priority`, `set_edge_triggered`, `acknowledge` (reads `GICC_IAR`) and `end_of_interrupt` (writes the raw IAR value to `GICC_EOIR`). Spurious ID is 1023.
+
+GICD and GICC base addresses come from the active board: `0x10_7FFF_9000` and `0x10_7FFF_A000` on Pi 5, and `0x0800_0000` and `0x0801_0000` on QEMU `virt`. Without either board feature, `gic::init` only logs a warning.
+
+## Generic timer and scheduler tick
+
+`interrupts::init` enables the non-secure physical timer PPI (ID 30, `TIMER_PHYS`) at priority `0x80` and calls `init_timer`. `set_next_timer` reads `CNTFRQ_EL0` and `CNTPCT_EL0`, programs `CNTP_CVAL_EL0` for `cntfrq / 100` ticks ahead (a 100 Hz tick, 10 ms), and enables `CNTP_CTL_EL0`.
+
+`handle_irq` acknowledges the IRQ, ignores spurious IDs, and dispatches:
+
+- **Timer (ID 30):** `handle_timer_interrupt` clears the timer, programs the next compare value, wakes expired sleepers, builds a BPF context that includes interrupt latency (ticks from the vector-entry timestamp to now, converted using `CNTFRQ_EL0`), runs the `ATTACH_TYPE_TIMER` BPF hooks, and (bench builds only) drains the deferred serial buffer. EOI is sent, then `cpu::timer_tick()` may trigger a scheduling decision.
+- **ID 160 on `rpi5`:** the RP1 GPIO interrupt (see [RP1 Peripherals](/axiomos/fpga-bringup/platform/rp1)); calls `rpi5::gpio::handle_interrupt`.
+- **Anything else:** logged as unhandled, then EOI.
+
+Interrupt latency is computed in code, but the repository states that historical latency numbers lack retained raw captures and that tail latency under load is unmeasured. See the [hardware validation runbook](https://github.com/pro-utkarshM/axiomOS/blob/feat/fpga-bringup/docs/operations/hardware-validation-and-benchmarking.md).
+
+## MMU and address space
+
+Constants are in [`mem.rs`](https://github.com/pro-utkarshM/axiomOS/blob/feat/fpga-bringup/kernel/src/arch/aarch64/mem.rs), setup is in [`mm.rs`](https://github.com/pro-utkarshM/axiomOS/blob/feat/fpga-bringup/kernel/src/arch/aarch64/mm.rs) and [`paging.rs`](https://github.com/pro-utkarshM/axiomOS/blob/feat/fpga-bringup/kernel/src/arch/aarch64/paging.rs).
+
+| Property | Value |
+|---|---|
+| Granule / VA size | 4 KiB, 48-bit VA (`T0SZ = T1SZ = 16`) |
+| Translation roots | `TTBR0_EL1` (user / identity), `TTBR1_EL1` (kernel) |
+| Physical address size | `TCR_EL1.IPS` set for 48-bit PA |
+| Cacheability in TCR | Inner shareable, write-back for both halves |
+| Direct map (HHDM-like) | `0xFFFF_8000_0000_0000` (L0 index 256), up to 64 TiB |
+| Kernel heap | `0xFFFF_C000_0000_0000`, 4 GiB maximum |
+| Per-CPU stacks | `0xFFFF_D000_0000_0000`, 64 KiB each |
+| MMIO region | `0xFFFF_E000_0000_0000`, 16 TiB |
+| User stack top | `0x0000_007F_0000_0000` |
+| MAIR attributes | 0 Device-nGnRnE, 1 Device-nGnRE, 2 Normal write-back, 3 Normal non-cacheable |
+
+`mm::init` runs these steps:
+
+1. `phys::init_stage1` starts a bump physical allocator, reserving the DTB range and the kernel image (`__text_start` to `__bss_end`) first.
+2. `setup_kernel_page_tables` builds four statically allocated tables (`l0_user`, `l0_kernel`, `l1_low`, `l1_high`). Physical memory is mapped as **1 GiB block descriptors**, for at least 4 GiB (more if the DTB reports more), both as an identity map in the low half and in the higher-half direct map.
+3. `configure_mair`, `configure_tcr`, set `TTBR0`/`TTBR1`, then `enable_mmu` sets `SCTLR_EL1` bits M, C and I (`0x1005`).
+4. After the heap exists, `init_stage2` initializes the full physical-frame manager.
+
+Board differences in this map:
+
+- **`virt`:** the first 1 GiB block (device space below RAM) is mapped Device-nGnRE with UXN and PXN, and the rest as Normal write-back.
+- **`rpi5`:** the first GiB is Normal write-back because the kernel is loaded at `0x8_0000` inside RAM. Additional 1 GiB device blocks are mapped for the BCM2712 PCIe2/MIP0 aperture (`0x10_0000_0000`), UART10, the GIC, and the RP1 aperture (`0x1F_0000_0000`), all Device-nGnRE with execute-never.
+
+`create_user_address_space` builds per-process roots. The README notes a copy-on-write fork on AArch64 that x86_64 lacks, and no demand paging on either.
+
+## Per-CPU state and context switching
+
+`cpu.rs` keeps a per-CPU `ExecutionContext` pointer in `TPIDR_EL1`. `context.rs` implements task switching with the callee-saved registers and `TTBR` values in `ArchState`, and `restore_user_context`, which returns to EL0 from a saved `ExceptionContext` plus `SP_EL0`.
+
+## Shutdown and reboot
+
+`shutdown.rs` issues PSCI `SYSTEM_OFF` (`0x84000008`) and `SYSTEM_RESET` (`0x84000009`) with `hvc #0`, and loops on `wfi` if the call returns. The same code serves both boards; whether the Pi 5 firmware answers PSCI over HVC after the kernel drops from EL2 to EL1 is not demonstrated in the repository's docs.
+
+## QEMU `virt` board
+
+Source: [`platform/virt/`](https://github.com/pro-utkarshM/axiomOS/blob/feat/fpga-bringup/kernel/src/arch/aarch64/platform/virt/mod.rs).
+
+| Item | Value |
+|---|---|
+| Console | PL011 UART, base `0x0900_0000`, initialized lazily and used for `serial_print` |
+| GIC | GICD `0x0800_0000`, GICC `0x0801_0000` |
+| VirtIO MMIO | 32 slots starting at `0x0A00_0000`, `0x200` bytes each |
+| Kernel load address | `0x4008_0000` |
+| Boot banner | `=== axiomos on QEMU virt ===` |
+
+The `virt` init also writes a raw `A` to `0x0900_0000` in `_start` as an early liveness probe. After `mcore::init`, `kernel::init` scans the VirtIO MMIO slots and initializes any VirtIO block device found (see [Drivers](/axiomos/fpga-bringup/platform/drivers)). Other VirtIO device types are logged and left uninitialized, with a TODO in the source.
+
+ADR-0003 gives `virt` an experimental tier: the required evidence is a compile check only, and it is explicitly not a production hardware claim.

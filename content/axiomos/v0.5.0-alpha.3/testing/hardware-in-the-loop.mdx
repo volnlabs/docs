@@ -1,0 +1,70 @@
+import { Callout } from 'nextra/components'
+
+# Hardware-in-the-Loop
+
+Relevant source files
+
+- [docs/operations/release-verification.md](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/docs/operations/release-verification.md)
+- [docs/performance/current-results.md](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/docs/performance/current-results.md)
+- [scripts/benchmark/analyze-v03.py](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/scripts/benchmark/analyze-v03.py)
+- [scripts/benchmark/verifier-cost.py](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/scripts/benchmark/verifier-cost.py)
+- [kernel/Cargo.toml](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/kernel/Cargo.toml)
+- [ci/profiles/extended.toml](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/ci/profiles/extended.toml)
+
+<Callout type="warning">
+There is no hardware-in-the-loop CI. Raspberry Pi 5 testing is manual (README, issue 76). Nothing on this page runs in GitHub Actions or in `cargo xtask check all`. At this release the repository contains no HIL runbook and no `scripts/hil/` directory; the tooling below is what exists.
+</Callout>
+
+`docs/operations/release-verification.md` states that physical HIL and independent review remain separate evidence and must not be inferred from a local gate pass. The `v0.5.0-alpha.1` scope in that file explicitly does not claim physical robot HIL, hosted CI or a ForgeFPGA bitstream. The `extended` profile in `ci/profiles/extended.toml` lists an `hil` check id, but `engineering-audit.sh` contains no physical-hardware step.
+
+## Build and deploy
+
+Pi 5 images are built and deployed with xtask; see [Raspberry Pi 5](/axiomos/v0.5.0-alpha.3/getting-started/raspberry-pi-5) for detail.
+
+```bash
+export AXIOM_BPF_TRUSTED_KEY_PATH=/secure/path/axiomos-ed25519.pub
+cargo xtask build rpi5 -- release embedded-rpi5
+sha256sum -c target/aarch64-unknown-none/release/rpi5-artifacts.sha256
+cargo xtask deploy rpi5 -- /path/to/mounted/pi-boot
+```
+
+## The `bench` feature
+
+`kernel/Cargo.toml` defines a `bench` feature for the v0.3 hardware bench: on-chip latency instrumentation (M-A, M-B, M-C), the physical e-stop button IRQ path, and an auto-loaded GPIO-to-stop reflex. It is off by default and is measurement and demo instrumentation, not for production images. Enable it alongside a profile:
+
+```bash
+cargo xtask build rpi5 -- release embedded-rpi5,bench
+```
+
+| Metric | Meaning |
+|--------|---------|
+| M-A | Actuation monitor overhead (`[bench] M-A monitor_overhead_ns=N`) |
+| M-B | E-stop IRQ entry to safe state (`[bench] M-B estop irq-entry->safe latency_ns=N`) |
+| M-C | Edge to PWM or GPIO apply (`[bench] M-C edge->pwm-apply ch=C val=V latency_ns=N`) |
+
+## Analyzing captures
+
+`scripts/benchmark/analyze-v03.py` parses `[bench]` serial lines and, optionally, a logic-analyzer CSV with columns for the GPIO23 input, GPIO12 PWM enable and GPIO24 e-stop (common aliases such as `ch0`, `ch1`, `ch2` are accepted).
+
+```bash
+scripts/benchmark/analyze-v03.py --serial bench.log [--logic capture.csv]
+scripts/benchmark/analyze-v03.py --self-test
+```
+
+It prints count, min, median, p99, p99.9 and max per metric and fails when thresholds are missed:
+
+| Check | Fails when |
+|-------|-----------|
+| M-A | No samples, or max is 5000 ns or more |
+| M-B | No samples, or max is 1 ms or more |
+| M-C | Fewer than 10,000 samples, or median is 1000 ns or more (the 1000 ns fallback; a median from 500 to under 1000 ns prints that the 500 ns target was missed) |
+
+The `--self-test` run is part of the `command-smoke` step in the audit gate. The gate does not run any physical campaign.
+
+## Verifier cost on the Pi 5
+
+A kernel built with `--features verifier-cost` emits an `AXIOM VERIFIER COST` marker per BPF load. `scripts/benchmark/verifier-cost.py` (`cargo xtask bench verifier`) turns the UART log into a CSV and plot; see [Benchmarks](/axiomos/v0.5.0-alpha.3/userspace/benchmarks).
+
+## Evidence
+
+Hardware results follow the same contract as any other campaign: exact commit, pinned toolchain, command, hardware boundary, raw capture, and hashes of the raw log and measured image. See the [evidence policy](/axiomos/v0.5.0-alpha.3/performance). At this release the only attributable campaign is the host BPF verifier benchmark; see [Current Results](/axiomos/v0.5.0-alpha.3/performance/current-results).

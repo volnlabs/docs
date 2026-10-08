@@ -1,0 +1,65 @@
+import { Callout } from 'nextra/components'
+
+# Audit Gate & Findings
+
+**Relevant source files**
+
+- [docs/security/gates/local-audit-gate.md](https://github.com/pro-utkarshM/axiomOS/blob/feat/fpga-bringup/docs/security/gates/local-audit-gate.md)
+- [docs/security/audit-runtime-findings.md](https://github.com/pro-utkarshM/axiomOS/blob/feat/fpga-bringup/docs/security/audit-runtime-findings.md)
+- [scripts/verify/engineering-audit.sh](https://github.com/pro-utkarshM/axiomOS/blob/feat/fpga-bringup/scripts/verify/engineering-audit.sh)
+- [ci/manifests/commands.toml](https://github.com/pro-utkarshM/axiomOS/blob/feat/fpga-bringup/ci/manifests/commands.toml)
+- [ci/profiles](https://github.com/pro-utkarshM/axiomOS/tree/feat/fpga-bringup/ci/profiles)
+- [tools/xtask/src/commands.rs](https://github.com/pro-utkarshM/axiomOS/blob/feat/fpga-bringup/tools/xtask/src/commands.rs)
+- [kernel/src/main.rs](https://github.com/pro-utkarshM/axiomOS/blob/feat/fpga-bringup/kernel/src/main.rs)
+
+GitHub Actions availability is deliberately **not** a prerequisite for audit remediation. The required evidence is a local gate run from the repository root. See [CI](/axiomos/fpga-bringup/testing/ci) for how the profiles and manifests are wired.
+
+## The local gate
+
+```bash
+cargo xtask check all --profile full     # required evidence
+cargo xtask check all --profile quick    # iteration only, not evidence
+cargo xtask check all --profile extended # release candidates: adds release-profile host tests and Lean
+```
+
+The full gate runs formatting, the [unsafe ledger](/axiomos/fpga-bringup/security/unsafe-code), component inventory and workspace/artifact drift checks, workflow parsing, host tests for both BPF profiles and the safety-boundary crates, strict per-crate Clippy, standalone workspace and firmware checks, both kernel target checks, the release build, fuzz builds, the cloud-profile BPF Miri suite, and the x86_64 release QEMU marker tests. `--no-qemu` exists for environments without QEMU; the run manifest records the skipped boot gate.
+
+Notable static steps:
+
+| Step | Checks |
+|---|---|
+| `xtask-manifest-drift` | `cargo xtask boundary --check`: workspace membership drift, duplicate artifact identities, `rootfs:*` artifacts vs. the production filesystem model |
+| `documentation-links` | Every repository-local Markdown link target exists |
+| `product-naming-static` | Lowercase `axiomos` as the active product name |
+| `benchmark-provenance-static` | Each published benchmark campaign's commit, raw-log hash, executable hash and source-input hashes |
+| `command-smoke` | Runs the safe documented entrypoints in `ci/manifests/commands.toml` with 30 s timeouts |
+| `ovmf-vars-isolation-static` | QEMU pflash uses `snapshot=on` so the pinned OVMF VARS template is never written |
+| `bpf-concurrency-boundary-static` | Lock-free `EpochSnapshot` is Loom-modeled; serialized `BpfManager` state is not given a fake second concurrency model |
+
+## Required QEMU markers
+
+The gate fails if the x86_64 QEMU boot misses any of these serial markers, or lacks evidence that a userspace process started:
+
+```text
+QEMU_BOOT_OK  USERCOPY_EFAULT_OK  UNKNOWN_SYSCALL_ENOSYS_OK  TLB_SHOOTDOWN_OK
+LIFECYCLE_EXIT_WAIT_OK  LIFECYCLE_FAULT_WAIT_OK  LIFECYCLE_EXEC_REJECT_OK
+LIFECYCLE_EXEC_WAIT_OK  BPF_HANDLE_REUSE_OK  BPF_OWNER_EXIT_OK  BPF_OWNER_RECLAIM_OK
+```
+
+`QEMU_BOOT_OK` is printed only after root mount and init creation ([Boot Flow](/axiomos/fpga-bringup/architecture/boot-flow)). The runner passes `--no-reboot` so a panic surfaces as a non-zero QEMU exit instead of a reset loop that wipes the captured log, and the smoke steps do not mask that exit code.
+
+## Run outputs
+
+Results go to `target/audit-verification/`: `manifest.txt` (commit, branch, dirty state, toolchain, host, mode, aggregate result), `results.tsv`, per-step `logs/`, `artifact-paths.txt`, `artifacts.sha256` for the kernel/ISO/disk, and `qemu-serial.log`.
+
+## Runtime findings
+
+<Callout type="warning">
+These are recorded observations, not fixes.
+</Callout>
+
+**Post-boot ring-3 page fault (`--smp 1`).** Originally, after `QEMU_BOOT_OK` and `INIT_PROCESS_STARTED`, init forked a child that exited with 42, and the next reschedule hit a user-mode instruction-fetch page fault at `0x2a00000012`. On re-investigation with the system OVMF and current kernel it **does not reproduce** (SMP 1 and SMP 2 for 120 to 240 s, with and without fault injection). The historical cause is unresolved: it could have been an init state bug or a kernel VM/context race. No regression gate was added because a deterministic gate would need a pinned, hash-verified copy of the system OVMF that originally exhibited it. The `qemu-smp1-smoke` step asserts boot-to-init markers and records (without failing) any later panic text.
+
+**Page-fault diagnostic omitted by design.** Adding fault address/IP/error-code printing to the panic path would take the same `spin::Mutex` on the serial port that an interrupted print may already hold, risking deadlock. A safe version needs a non-locking output path (raw UART, a static panic buffer, or hardware trace), which was out of scope.
+
+**OVMF pinning history.** `edk2-stable202508-r1` failed to bring the kernel up under `--smp 1` with KVM (Limine reloaded with no kernel output); the pin moved to `edk2-stable202511-r2`, which unblocked the single-CPU path.

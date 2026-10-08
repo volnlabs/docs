@@ -1,0 +1,116 @@
+import { Callout } from 'nextra/components'
+
+# RP1 Models
+
+**Relevant source files** (branch `fix/adapter-pid-readiness`; not on `main`)
+
+- [backends/renode/peripherals/RP1_GPIO.cs](https://github.com/volnlabs/voln-vp/blob/fix/adapter-pid-readiness/backends/renode/peripherals/RP1_GPIO.cs)
+- [backends/renode/peripherals/RP1_PWM.cs](https://github.com/volnlabs/voln-vp/blob/fix/adapter-pid-readiness/backends/renode/peripherals/RP1_PWM.cs)
+- [backends/renode/tests/rp1-gpio.robot](https://github.com/volnlabs/voln-vp/blob/fix/adapter-pid-readiness/backends/renode/tests/rp1-gpio.robot)
+- [backends/renode/tests/rp1-gpio-invalid.robot](https://github.com/volnlabs/voln-vp/blob/fix/adapter-pid-readiness/backends/renode/tests/rp1-gpio-invalid.robot)
+- [backends/renode/tests/rp1-pwm.robot](https://github.com/volnlabs/voln-vp/blob/fix/adapter-pid-readiness/backends/renode/tests/rp1-pwm.robot)
+- [backends/renode/tests/rp1-pwm-invalid.robot](https://github.com/volnlabs/voln-vp/blob/fix/adapter-pid-readiness/backends/renode/tests/rp1-pwm-invalid.robot)
+- [docs/contracts/rp1-gpio-model.md](https://github.com/volnlabs/voln-vp/blob/fix/adapter-pid-readiness/docs/contracts/rp1-gpio-model.md)
+- [docs/contracts/rp1-pwm-model.md](https://github.com/volnlabs/voln-vp/blob/fix/adapter-pid-readiness/docs/contracts/rp1-pwm-model.md)
+- [docs/probes/2026-10-01-renode-model-audit.md](https://github.com/volnlabs/voln-vp/blob/fix/adapter-pid-readiness/docs/probes/2026-10-01-renode-model-audit.md)
+
+<Callout type="warning">
+None of this exists on `main`. The models live on the stacked branches `feat/rp1-pwm-model`, `feat/rp1-gpio-model`, `feat/rp1-rio-model`, `feat/rp1-pad-gating` (all contained in `fix/adapter-pid-readiness`). They are **isolated unit models**: not installed in `virt-pi5.repl`, not attached through PCIe, and they qualify no guest driver.
+</Callout>
+
+## Why C# and not RP2040 reuse
+
+The spec planned to adapt Renode's RP2040 models and write Python peripherals first. The Renode model audit (2026-10-01, Renode `1.16.1.16973`) found:
+
+| Candidate | Finding |
+|---|---|
+| RP1 / RP2040 / BCM2712 types | No matching public types or platform entries among 1,234 enumerated `Antmicro.Renode.Peripherals.*` types |
+| `PCIeBasePeripheral`, `PCIeEndpoint`, `PCIeRootComplex`, BAR classes | Present; candidates for endpoint plumbing, untested for BCM2712/RP1 |
+| `MPFS_PCIe` | Different controller; cannot substitute |
+| `picosoc.repl` | PicoRV32 CPU, not an RP2040 peripheral implementation |
+| PL011 reserved offset `0x40` | Silently ignored with no log, so warning detection alone cannot prove strict coverage |
+
+`TODO_NOW.md` also notes that interconnect/PCIe modeling requires C# rather than request-based Python peripherals. Both RP1 models are therefore C# and validate every access themselves.
+
+## Common strictness rules
+
+- Only aligned 32-bit accesses. Byte, word, and quadword interfaces are implemented explicitly to throw, so the bus cannot silently translate them.
+- Unsupported offsets, aliases, bits, or control combinations log an Error (`RP1_GPIO_UNSUPPORTED` / `RP1_PWM_UNSUPPORTED`) and throw **before** mutating state.
+- State changes stream to the log as `RP1_GPIO_STATE` / `RP1_PWM_STATE` with sequence number and virtual timestamp. Capture sequence and unsupported-access counts survive reset.
+- With `VOLN_VP_STRICT_MMIO=1`, the Renode runtime adapter also fails on any retained native warning, including unmapped bus accesses. Model Error logs fail the adapter regardless of the flag.
+
+## RP1_GPIO: IO_BANK0, RIO and pads
+
+`RP1_GPIO(IMachine machine)` models 28 pins and implements `IGPIOReceiver`. It exposes three connection regions: default (IO_BANK0), `rio`, and `pads`. Each supports atomic alias windows at `+0x1000` (XOR), `+0x2000` (SET), `+0x3000` (CLEAR); alias reads do not mutate.
+
+| Register | Offset | Modeled behavior |
+|---|---|---|
+| STATUS | `8*pin` | Read-only: input bit 17, peripheral out/oe bits 8/12, effective out/oe bits 9/13, event bits 20-23, combined IRQ bits 28/29 |
+| CTRL | `8*pin+4` | Reset `0x9f`; FUNCSEL 5 (GPIO/RIO) and 31 (NULL) only; OUTOVER/OEOVER; event masks; self-clearing IRQRESET bit 28 |
+| INTR | `0x100` | Per-pin bitmap after event masks |
+| PCIE_INTE | `0x11c` | 28-bit destination enable |
+| PCIE_INTS | `0x124` | `INTR & PCIE_INTE`; any bit asserts the Renode `IRQ` line |
+| RIO OUT / OE | `rio` `0x00` / `0x04` | GPIO0-27 output source when FUNCSEL is 5; reset to zero as an explicit unit preset |
+| Pad | `pads` `4 + 4*pin` | Bits 7:0 stored; OD (bit 7) gates output drive; IE (bit 6) gates input sampling; reset `0x9a` (GPIO0-8), `0x96` (GPIO9-27) |
+
+Behavioral policies:
+
+- `OnGPIO(pin, value)` supplies an external digital level, gated by IE. Edges latch independently of masks; repeated values create no edge.
+- IE clear samples low. Toggling IE resamples a held external level, so enabling IE while high latches a rising edge. This is a documented unit-test policy, not validated hardware timing.
+- Outputs never loop back into inputs. Drive strength, pulls, Schmitt and slew bits are readback only; no analog behavior.
+- RIO SYNC_IN and other RIO inputs, alternate peripheral muxing, F_M changes, filtered/debounced events, INOVER/IRQOVER, VOLTAGE_SELECT, and PCIE_INTF are rejected.
+
+## RP1_PWM
+
+`RP1_PWM(IMachine machine, long frequency)` models four channels with an explicit, positive clock frequency.
+
+| Register | Offset | Behavior |
+|---|---|---|
+| GLOBAL_CTRL | `0x00` | Channel enable bits 0-3; SET_UPDATE bit 31 |
+| Channel CTRL | `0x14 + 0x10*n` | Reset `0x100`; modes constant-zero and trailing-edge, optional inversion; FIFO_POP_MASK retained but inert |
+| Channel RANGE | `0x18 + 0x10*n` | Period in clock ticks |
+| Channel DUTY | `0x20 + 0x10*n` | High-time ticks |
+
+Timing policy (deterministic, not measured silicon):
+
+- SET_UPDATE applies the latest control/enables one model clock period after the first pending trigger; later writes do not postpone it.
+- RANGE/DUTY are staged and apply at the channel's next overflow; starting a stopped channel consumes the staged values immediately.
+- Zero-range trailing-edge activation is rejected.
+- Output is classified as `disabled`, `low`, `high`, or `pwm`. Individual pulse edges are not emitted.
+
+Phase, common/FIFO, interrupt, DMA, and sigma-delta registers are unsupported.
+
+## Running the native tests
+
+These run directly through `renode-test` with Renode's own Python environment; they are separate from hosted CI, which uses stand-in emulators.
+
+```sh
+timeout --kill-after=2s 60s renode-test --jobs=1 \
+  --keep-renode-output --save-logs always --results-dir /tmp/rp1-gpio-unit \
+  --variable MODEL_FILE:"$PWD/backends/renode/peripherals/RP1_GPIO.cs" \
+  backends/renode/tests/rp1-gpio.robot \
+  backends/renode/tests/rp1-gpio-invalid.robot
+
+timeout --kill-after=2s 60s renode-test --jobs=1 \
+  --keep-renode-output --save-logs always --results-dir /tmp/rp1-pwm-unit \
+  --variable MODEL_FILE:"$PWD/backends/renode/peripherals/RP1_PWM.cs" \
+  backends/renode/tests/rp1-pwm.robot \
+  backends/renode/tests/rp1-pwm-invalid.robot
+```
+
+The GPIO fixture maps IO_BANK0 at `0x10000`, RIO at `0x20000`, and pads at `0x30000` via `BusMultiRegistration`; these are test addresses, not the Pi map. The invalid suites expect exceptions, so their Robot assertions pass while their Error logs must fail an adapter run.
+
+## Recorded results
+
+| Model revision | Native tests | Probe |
+|---|---|---|
+| PWM | 12 pass | `2026-10-01-rp1-pwm-model.md` |
+| GPIO (IO_BANK0 + IRQ) | 9 pass | `2026-10-01-rp1-gpio-model.md` |
+| GPIO + RIO | 15 pass | `2026-10-01-rp1-rio-model.md` |
+| GPIO + RIO + pads | 21 pass | `2026-10-01-rp1-pad-gating.md` |
+
+Each probe also ran the real Renode runtime adapter with `VOLN_VP_STRICT_MMIO=1` for a positive suite (exit 0), the invalid suite (exit 1, model Error logs), and a deliberately wrong assertion (exit 1). All results recorded `qualification_claims: []`.
+
+## Still open
+
+PCIe root complex and RP1 endpoint, MSI-X/MIP delivery, RP1 clocks, PWM-to-pad muxing, installation into `virt-pi5`, and any guest-driver execution. See [RP1 Driver Coverage](/axiomos-sim/contracts/rp1-driver-coverage).

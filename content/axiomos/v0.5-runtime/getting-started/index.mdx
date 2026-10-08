@@ -1,0 +1,97 @@
+import { Callout, Cards } from 'nextra/components'
+
+# Getting Started
+
+Relevant source files
+
+- [README.md](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/README.md)
+- [CONTRIBUTING.md](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/CONTRIBUTING.md)
+- [rust-toolchain.toml](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/rust-toolchain.toml)
+- [Cargo.toml](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/Cargo.toml)
+- [docs/operations/build.md](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/docs/operations/build.md)
+- [ci/manifests/targets.toml](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/ci/manifests/targets.toml)
+
+axiomOS is a bare-metal Rust kernel with runtime-programmable behavior through verified eBPF programs. This section walks through the toolchain, how to build the images, how to boot them in QEMU, and how to put the kernel on a Raspberry Pi 5.
+
+<Callout type="warning">
+axiomOS is a research kernel under active hardware bring-up. The README states it is not production-ready. Raspberry Pi 5 testing is manual; there is no hardware-in-the-loop CI.
+</Callout>
+
+## Supported targets
+
+| Arch | Targets | Status (from README) |
+|------|---------|--------|
+| x86_64 | QEMU/OVMF, VMware, bare metal | Boot, userspace, VirtIO; Limine (UEFI and BIOS), APIC |
+| AArch64 | QEMU virt, Raspberry Pi 5 | Primary hardware target; GICv2/v3, RP1 GPIO/UART/PWM, device tree boot |
+| RISC-V | QEMU virt | Early bring-up, boot only, standalone demo kernel |
+
+The target manifest in `ci/manifests/targets.toml` classifies them more conservatively: x86_64 QEMU/OVMF is `supported`, Raspberry Pi 5 is `supported after HIL`, AArch64 virt is `experimental` (kernel check only), and the RISC-V demo is `experimental standalone`.
+
+## Prerequisites
+
+### Rust toolchain
+
+The toolchain is pinned in `rust-toolchain.toml` to a dated nightly. rustup installs it automatically on first `cargo` invocation in the repository.
+
+| Item | Value |
+|------|-------|
+| Channel | `nightly-2026-07-02` |
+| Components | `rustfmt`, `clippy`, `llvm-tools-preview`, `rust-src`, `miri` |
+| Targets | `x86_64-unknown-none`, `aarch64-unknown-none` |
+
+The channel is deliberately not floating: a bare `nightly` once let a new clippy rule silently turn the lint job red. Bump it deliberately. A nightly is required because the root manifest uses artifact dependencies (`artifact = "bin"`), enabled via `bindeps = true` in `.cargo/config.toml`.
+
+### System tools
+
+The root `build.rs` assembles a root filesystem image and, for x86_64, a bootable ISO. A clean machine without these tools fails inside `build.rs`.
+
+| Tool | Used for |
+|------|----------|
+| `git` | Cloning the pinned Limine bootloader checkout |
+| `make` | Building Limine |
+| `mke2fs` (e2fsprogs) | Creating the ext2 rootfs image |
+| `xorriso` | Building the bootable ISO |
+| `qemu-system-x86_64` / `qemu-system-aarch64` | Running the images |
+| `llvm-objcopy` or `rust-objcopy` | Producing `kernel8.img` for the Pi 5 |
+
+Optional: GDB or LLDB for `--debug`; `cargo-binutils` if you need `rust-objcopy`.
+
+```bash
+# Debian/Ubuntu example from CONTRIBUTING.md
+sudo apt update && sudo apt install -y xorriso qemu-system
+```
+
+### Pinned external inputs
+
+`ci/manifests/build-inputs.env` pins the inputs that `build.rs` fetches:
+
+| Input | Value |
+|-------|-------|
+| `LIMINE_REF` | `v9.6.7-binary` |
+| `LIMINE_REVISION` | `ee5d29cd0a8034612dcd1df3f00052480db785c5` |
+| `OVMF_TAG` | `edk2-stable202511-r2` |
+
+### BPF trust key
+
+Kernels are signed-only by default. The kernel embeds a 32-byte Ed25519 public key at compile time from the path in `AXIOM_BPF_TRUSTED_KEY_PATH` (`kernel/src/bpf/trust.rs`), and `scripts/build/rpi5.sh` and `scripts/run/virt.sh` refuse to run without it. The `bpf-unsigned-development` feature compiles that requirement out; see [Building](/axiomos/v0.5-runtime/getting-started/building).
+
+## First run
+
+```bash
+# Build and run in QEMU (x86_64)
+cargo run
+
+# Raspberry Pi 5 build (kernel8.img with embedded ext2 rootfs)
+cargo xtask build rpi5
+```
+
+The `cargo xtask` alias is defined in `.cargo/config.toml` as `run --locked --package xtask --`. Per `docs/operations/README.md`, `cargo xtask` is the canonical interface and scripts under `scripts/` are its implementation helpers.
+
+## Where to go next
+
+<Cards>
+  <Cards.Card title="Building" href="/axiomos/v0.5-runtime/getting-started/building" />
+  <Cards.Card title="Running in QEMU" href="/axiomos/v0.5-runtime/getting-started/qemu" />
+  <Cards.Card title="Raspberry Pi 5" href="/axiomos/v0.5-runtime/getting-started/raspberry-pi-5" />
+  <Cards.Card title="Testing" href="/axiomos/v0.5-runtime/testing" />
+</Cards>

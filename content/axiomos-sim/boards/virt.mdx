@@ -1,0 +1,40 @@
+# virt (QEMU)
+
+**Relevant source files**
+
+- [boards/virt/board.toml](https://github.com/volnlabs/voln-vp/blob/main/boards/virt/board.toml)
+- [boards/virt/qemu/aarch64.sh](https://github.com/volnlabs/voln-vp/blob/main/boards/virt/qemu/aarch64.sh)
+- [boards/virt/qemu/x86_64.sh](https://github.com/volnlabs/voln-vp/blob/main/boards/virt/qemu/x86_64.sh)
+- [boards/virt/qemu/riscv64.sh](https://github.com/volnlabs/voln-vp/blob/main/boards/virt/qemu/riscv64.sh)
+- [backends/qemu/runner.py](https://github.com/volnlabs/voln-vp/blob/main/backends/qemu/runner.py)
+
+```toml
+name = "virt"
+memory = "1GB"
+default_backend = "qemu"
+backends = ["qemu"]
+```
+
+`virt` is the generic QEMU board covering three guest architectures, selected by `VOLN_VP_ARCH` (default `aarch64`). The per-architecture scripts under `boards/virt/qemu/` each `exec python3 backends/qemu/runner.py <arch> run "$@"`; `backends/qemu/adapters/run.sh` selects one of them.
+
+## Machine configurations
+
+All architectures share the base flags `-accel tcg -display none -monitor none -serial stdio -no-reboot`.
+
+| Arch | Machine flags | Inputs |
+|---|---|---|
+| `aarch64` | `-machine virt -m 1G -cpu cortex-a57 -kernel KERNEL`, raw disk as `virtio-blk-device` with `snapshot=on`, `-semihosting` | `AXIOMOS_KERNEL`, `AXIOMOS_DISK_IMAGE` |
+| `x86_64` | `-m 4G -cpu max -smp 1 -vga none`, OVMF code as read-only pflash unit 0, OVMF vars as pflash unit 1 with `snapshot=on`, `-cdrom ISO`, raw disk as `virtio-blk-pci` with `snapshot=on` | `AXIOMOS_ISO`, `AXIOMOS_DISK_IMAGE`, `AXIOMOS_OVMF_CODE`, `AXIOMOS_OVMF_VARS` |
+| `riscv64` | `-machine virt -bios default -kernel KERNEL` | `AXIOMOS_KERNEL` |
+
+## Expected guest and markers
+
+| Arch | Expected image | `test` markers |
+|---|---|---|
+| `aarch64` | AArch64 ELF built for `virt,cloud-profile`, with a matching ext2 rootfs containing `/bin/init` | `=== axiomos eBPF init ===` |
+| `x86_64` | axiomOS ISO + disk image + OVMF | `=== axiomos eBPF init ===` |
+| `riscv64` | RISC-V demo ELF | both `axiomos RISC-V demo` and `Kernel booted via OpenSBI firmware` (demo boot, not userspace) |
+
+## Status
+
+As of the `main` evidence ([2026-09-28 probe](/axiomos-sim/probes)): x86_64 fails with `BOOT_FATAL code=root-filesystem-invalid`; AArch64 and RISC-V were not validated because no compatible prebuilt image was identified. See [QEMU backend](/axiomos-sim/backends/qemu) for runner behavior.

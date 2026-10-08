@@ -1,0 +1,151 @@
+import { Callout, Steps } from 'nextra/components'
+
+# Raspberry Pi 5
+
+<details>
+<summary>Relevant source files</summary>
+
+- [kernel/platform/rpi5/config/config.txt](https://github.com/pro-utkarshM/axiomOS/blob/main/kernel/platform/rpi5/config/config.txt)
+- [kernel/linker-aarch64.ld](https://github.com/pro-utkarshM/axiomOS/blob/main/kernel/linker-aarch64.ld)
+- [kernel/src/arch/aarch64/platform/rpi5/mod.rs](https://github.com/pro-utkarshM/axiomOS/blob/main/kernel/src/arch/aarch64/platform/rpi5/mod.rs)
+- [kernel/src/arch/aarch64/platform/rpi5/memory_map.rs](https://github.com/pro-utkarshM/axiomOS/blob/main/kernel/src/arch/aarch64/platform/rpi5/memory_map.rs)
+- [kernel/src/arch/aarch64/platform/rpi5/uart.rs](https://github.com/pro-utkarshM/axiomOS/blob/main/kernel/src/arch/aarch64/platform/rpi5/uart.rs)
+- [kernel/src/arch/aarch64/platform/rpi5/control_link.rs](https://github.com/pro-utkarshM/axiomOS/blob/main/kernel/src/arch/aarch64/platform/rpi5/control_link.rs)
+- [kernel/src/bench.rs](https://github.com/pro-utkarshM/axiomOS/blob/main/kernel/src/bench.rs)
+- [kernel/src/driver/ram.rs](https://github.com/pro-utkarshM/axiomOS/blob/main/kernel/src/driver/ram.rs)
+- [kernel/Cargo.toml](https://github.com/pro-utkarshM/axiomOS/blob/main/kernel/Cargo.toml)
+- [docs/operations/hardware-validation-and-benchmarking.md](https://github.com/pro-utkarshM/axiomOS/blob/main/docs/operations/hardware-validation-and-benchmarking.md)
+- [docs/operations/wiring/axiomos-estop-wiring.pdf](https://github.com/pro-utkarshM/axiomOS/blob/main/docs/operations/wiring/axiomos-estop-wiring.pdf)
+- [docs/decisions/0003-supported-targets.md](https://github.com/pro-utkarshM/axiomOS/blob/main/docs/decisions/0003-supported-targets.md)
+
+</details>
+
+The Raspberry Pi 5 (BCM2712 SoC plus the RP1 southbridge) is axiomOS's primary hardware target. ADR-0003 classifies it as **Supported after HIL**: it is not considered supported until physical boot, GPIO IRQ, control-link, timer, storage and failure-state hardware-in-the-loop evidence exists.
+
+<Callout type="warning">
+  The README describes the project as "a research kernel under active hardware bring-up on Raspberry Pi 5. Not production-ready." The hardware runbook says it "does not authorize a safety-relevant robot deployment" and that physical performance or safety must not be claimed until every required physical check has retained evidence. Historical Pi latency and boot-time numbers are archived until they are re-run with retained raw logs and artifact hashes.
+</Callout>
+
+## Build and deploy
+
+The kernel is built for `aarch64-unknown-none` with the `embedded-rpi5` feature (which enables `embedded-profile` and `rpi5`). From the runbook:
+
+```sh
+cargo xtask build rpi5 -- release embedded-rpi5
+cargo xtask deploy rpi5 --dry-run -- /path/to/mounted/pi-boot
+cargo xtask deploy rpi5 -- /path/to/mounted/pi-boot
+```
+
+The build embeds a 32-byte Ed25519 public key (`AXIOM_BPF_TRUSTED_KEY_PATH`) as the BPF trust root and writes `rpi5-artifacts.sha256` covering the ELF, `kernel8.img`, the root filesystem and the key. `deploy` verifies the hashes before copying `kernel8.img` and the provenance manifest to the SD card boot partition. The repository does not fetch or pin the Raspberry Pi boot firmware itself; the runbook asks operators to record whichever firmware revision is on the card.
+
+Separate instrumented images exist and must not be used as production images: `verifier-cost`, `bench` (and `bench-*` variants), `bringup-diagnostics` and `trace-control-link`.
+
+## Boot configuration
+
+[`config.txt`](https://github.com/pro-utkarshM/axiomOS/blob/main/kernel/platform/rpi5/config/config.txt) is copied to the boot partition:
+
+| Setting | Purpose (from the file's comments) |
+|---|---|
+| `arm_64bit=1` | 64-bit kernel |
+| `kernel=kernel8.img` | Pi 5 loads `kernel8.img` for 64-bit kernels |
+| `pciex4_reset=0` | Keep the RP1 southbridge in its firmware-initialized state; without it RP1 peripherals (UART, GPIO) are not accessible |
+| `enable_rp1_uart=1` | Pre-configure RP1 UART0 at 115200 8N1 |
+| `enable_uart=1`, `uart_2ndstage=1` | UART output and early boot UART |
+| `dtoverlay=disable-bt` | Bluetooth otherwise uses the UART pins |
+| `disable_splash=1` | Skip the rainbow splash |
+| `gpu_mem=16` | Minimum GPU memory; the kernel does not use the GPU |
+
+The file describes `pciex4_reset=0` and `enable_rp1_uart=1` as "firmware shortcuts" that exist because the kernel has no full PCIe driver. The kernel relies on the firmware having trained the PCIe link to RP1 and mapped RP1 at a fixed physical window.
+
+## Boot flow
+
+<Steps>
+
+### Firmware to `_start_asm`
+
+The firmware loads `kernel8.img` at physical `0x0008_0000` (the link address in `linker-aarch64.ld`) and jumps to `_start_asm` with the DTB address in `x0`. Core 0 continues, other cores are parked, EL2 is dropped to EL1, `.bss` is cleared, and `VBAR_EL1` is set. See [AArch64](/axiomos/main/platform/aarch64).
+
+### Rust `_start` and platform init
+
+`_start` stores the DTB address, calls `rpi5::init()` (which is intentionally side-effect free: the debug UART is lazily initialized on the first log write), then parses the DTB for memory regions ([Device Tree](/axiomos/main/platform/device-tree)).
+
+### `kernel::init`
+
+Architecture init (exception vectors, MMU, GICv2, timer at 100 Hz, syscall), BPF manager, VFS, IIO, scheduler, and then an **embedded RAM disk** registered as block device 0. The root filesystem is an image compiled into the kernel (`include_bytes!` of `EMBEDDED_DISK_PATH`) and copied to the heap, not read from the SD card or NVMe. No Pi 5 storage driver exists in the reviewed code.
+
+### Root mount, init, control link
+
+`main` mounts the ext2 root, starts `/bin/init`, then calls `control_link::spawn()` to start the Shrike UART poller task. In `bench` builds it also prints `PI5_BOOT_OK`.
+
+</Steps>
+
+## Console
+
+The kernel console is the **BCM2712 PL011 UART10** at physical `0x10_7D00_1000`, the board's dedicated debug connector, which is what the official Raspberry Pi Debug Probe attaches to. `Rp1Uart` in `uart.rs` (despite its name) points at UART10 and deliberately does not reprogram the baud or line control, relying on the firmware's setup. The HIL wiring notes confirm this: the Debug Probe connects to the Pi's dedicated 3-pin UART connector, with the instruction not to move it to GPIO14/15 on the 40-pin header.
+
+Note on the config file: its trailing comments describe a USB-TTL adapter on GPIO14/15 for a serial console. In the current kernel, GPIO14/15 (RP1 UART0) is instead the **Shrike control-link UART**, so the debug-connector UART10 is the console. The `config.txt` comment text appears to predate that split.
+
+Early bring-up code also writes single-character markers directly to UART10 (for example `{`, `|`, `}` in `boot.S`); in Rust these are gated behind the `bringup-diagnostics` feature.
+
+## Memory map used by the kernel
+
+From [`memory_map.rs`](https://github.com/pro-utkarshM/axiomOS/blob/main/kernel/src/arch/aarch64/platform/rpi5/memory_map.rs):
+
+| Region | Physical address |
+|---|---|
+| DRAM base / kernel load | `0x0` / `0x8_0000` |
+| BCM2712 PCIe2 root complex | `0x10_0012_0000` |
+| BCM2712 MIP0 (MSI controller) | `0x10_0013_0000` |
+| UART10 (debug console) | `0x10_7D00_1000` |
+| GIC-400 distributor / CPU interface | `0x10_7FFF_9000` / `0x10_7FFF_A000` |
+| RP1 peripheral window (PCIe BAR1) | `0x1F_0000_0000` |
+
+RP1 peripheral offsets are listed on the [RP1](/axiomos/main/platform/rp1) page.
+
+## What the code supports on hardware
+
+| Capability | State according to the source |
+|---|---|
+| Boot to scheduler on core 0 | Implemented; single core (secondary cores parked) |
+| Timer tick (100 Hz generic timer) and preemption | Implemented; HIL timer evidence is a required but separately tracked item |
+| Debug console (UART10) | Implemented |
+| GPIO input/output, edge interrupts | Implemented for 28 user pins via RP1 IO_BANK0 and the PCIe MSI-X route |
+| PWM (RP1 PWM0/PWM1) | Implemented; PWM0 clock enable follows Linux `clk-rp1` |
+| Shrike control link over RP1 UART0 (GPIO14/15) | Implemented as a polled transport; IRQ-driven RX is deferred |
+| I2C, SPI, CAN, Ethernet | Not implemented (README: only GPIO, PWM, UART on RP1) |
+| SD/NVMe/USB storage | Not implemented; root filesystem is an embedded RAM disk |
+| Secondary cores | Not brought up in the reviewed code |
+| Hardware watchdog | Not integrated (README, issue 72); a software `watchdog` hook triggers the e-stop path |
+
+## Hardware validation and HIL notes
+
+The runbook ([hardware-validation-and-benchmarking.md](https://github.com/pro-utkarshM/axiomOS/blob/main/docs/operations/hardware-validation-and-benchmarking.md)) is a checklist, not a results log. Key structure:
+
+- **Stop conditions:** unexpected reset, panic, missing serial marker, failed provenance hash, watchdog reset, PWM output while e-stop is active, or any uncontrolled actuator movement. Remove motor power and preserve the capture.
+- **Serial capture:** 115200 baud from the Debug Probe UART, captured to a log before applying Pi power.
+- **Bring-up stages:** (4.1) kernel and rootfs markers such as `INIT_PROCESS_STARTED`; (4.2) GPIO/timer/BPF dispatch, at least 100 injected edges per type with motors disconnected; (4.3) Shrike control link and RP2040; (4.4) final PWM safety gate and any powered actuator test; (4.5) one-hour pilot and a 24-hour unloaded electronics soak.
+- **Powered actuator tests** are explicitly deferred in the current electronics campaign.
+- **Benchmarks:** GPIO-to-actuation and e-stop latency must use a `bench` image and an independent logic analyzer. Bench images use a bounded deferred console (16 KiB queue, 1024-byte record limit, at most 64 nonblocking UART sends per 100 Hz tick), and any `PI5_BENCH_LOG_LOSS` marker invalidates serial-derived evidence. The runbook states this is not a zero-overhead or WCET claim.
+- **QEMU and RTL simulation** results are preflight evidence only and must not be converted into physical timing or safety claims.
+
+### Bench pin assignments
+
+From [`bench.rs`](https://github.com/pro-utkarshM/axiomOS/blob/main/kernel/src/bench.rs) (BCM GPIO numbering):
+
+| Signal | GPIO | Notes |
+|---|---|---|
+| Sensor trigger | 23 | Reflex fires on rising edge |
+| E-stop button | 24 | Normally-closed contact held high; open, pressed or broken wire reads low (10k pull-down) |
+| PWM output | 12 | RP1 PWM0 hardware channel 0 (Alt0); the monitor's 1-based channel 1 |
+
+### E-stop test wiring (unloaded)
+
+The `axiomos-estop-wiring` sheet describes a no-motor, no-driver test with a Pi 5, a Shrike board as a stimulus source, a logic analyzer and the Debug Probe. Points stated in the text version:
+
+- Wire with both boards unpowered; all GPIO signals are 3.3 V; do not connect a power rail to GPIO24.
+- The text export is a flattened diagram, so exact connections should be checked against the PNG or PDF in `docs/operations/wiring/`. It lists: Pi pin 18 (GPIO24) as the e-stop input with Shrike GP21 as the stimulus (LOW means asserted); Pi pin 16 (GPIO23) as the sensor line with Shrike GP22 held LOW; Pi pin 32 (GPIO12) as the PWM output.
+- Logic analyzer input 1 (D0) is moved from pin 16 to pin 18 relative to the sensor test and taps the Pi side of a 220 ohm resistor; input 2 (D1) stays on pin 32 behind a 220 ohm resistor.
+- Common ground via pins 14 and 20.
+- Power-on order: SD prepared and wiring done with Pi power off; connect Shrike, analyzer and Debug Probe USB; run the capture script and power the Pi only when prompted. The test image is `bench-estop-rearm`, whose automatic output rearm on release is diagnostic-only and "not the FPGA/motor cutoff test".
+
+Related scripts live under `scripts/hil/` (for example `v03d-estop-cycle.sh`, `gpio23-probe.sh`, `shrike-gpio23-pulse.sh`). The repository's CI has no hardware-in-loop job: README states Pi 5 testing is manual (issue 76).

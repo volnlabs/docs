@@ -1,0 +1,8 @@
+{
+  "axiomos/main":           { "repo": "/home/utkarsh/Work/axiomOS",              "branch": "main",                   "github": "pro-utkarshM/axiomOS", "synced": "b8953b593d5f" },
+  "axiomos/v0.5-runtime":   { "repo": "/home/utkarsh/Work/axiomOS",              "branch": "feat/v0.5-runtime",      "github": "pro-utkarshM/axiomOS", "synced": "9be704c8ef90" },
+  "axiomos/fpga-bringup":   { "repo": "/home/utkarsh/Work/axiomOS",              "branch": "feat/fpga-bringup",      "github": "pro-utkarshM/axiomOS", "synced": "e70e3f09a2ed" },
+  "axiomos/v0.5.0-alpha.3": { "repo": "/home/utkarsh/Work/axiomOS",              "branch": "release/v0.5.0-alpha.3", "github": "pro-utkarshM/axiomOS", "synced": "0567193e7628" },
+  "rbpf":                   { "repo": "/home/utkarsh/Work/volnlabs/rbpf",        "branch": "main",                   "github": "volnlabs/rbpf",        "synced": "835343191d1d" },
+  "axiomos-sim":            { "repo": "/home/utkarsh/Work/volnlabs/axiomos-sim", "branch": "main",                   "github": "volnlabs/voln-vp",     "synced": "8457aa166041" }
+}

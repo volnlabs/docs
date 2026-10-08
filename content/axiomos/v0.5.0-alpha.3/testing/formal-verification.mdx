@@ -1,0 +1,64 @@
+import { Callout } from 'nextra/components'
+
+# Formal Verification
+
+Relevant source files
+
+- [formal/README.md](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/formal/README.md)
+- [formal/AxiomFormal/Tnum.lean](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/formal/AxiomFormal/Tnum.lean)
+- [formal/AxiomFormal.lean](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/formal/AxiomFormal.lean)
+- [formal/lean-toolchain](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/formal/lean-toolchain)
+- [formal/lakefile.toml](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/formal/lakefile.toml)
+
+The `formal/` directory is a Lean 4 project (toolchain `leanprover/lean4:v4.31.0`, Lean core only, no mathlib) holding machine-checked proofs about one piece of the BPF verifier: the tnum abstract domain. It is the proof-of-concept for the repository's issue 91, a formal proof of verifier core invariants.
+
+<Callout type="warning">
+Only the tnum operations `add`, `sub` and `and` are proven. This is not a proof that the verifier is sound, that the Rust code matches the Lean model beyond a hand transcription, or that accepted programs are safe. The README lists the larger theorem as a roadmap.
+</Callout>
+
+## What is modeled
+
+A tnum ("tracked number") represents a set of 64-bit values by a `value` (known bits) and a `mask` (unknown bits). `Tnum.lean` models `TnumValue` from `kernel/crates/kernel_bpf/src/verifier/state.rs` over `BitVec 64`. It is a transcription of the Rust operators, which follow Linux `kernel/bpf/tnum.c`.
+
+| Definition | Meaning |
+|------------|---------|
+| `Tnum` | Structure with `value` and `mask`, both `BitVec 64` |
+| `WellFormed t` | `t.value &&& t.mask = 0`: no bit is both known and unknown |
+| `Mem x t` | `x &&& ~~~t.mask = t.value &&& ~~~t.mask`; mirrors `TnumValue::contains` and does not presuppose well-formedness |
+| `const n`, `unknown` | `TnumValue::const_val` and `TnumValue::unknown` |
+| `add`, `sub`, `and` | Transcriptions of `TnumValue::add`, `sub`, `and` |
+
+## What is proven
+
+Proofs discharge with `bv_decide`, which bit-blasts to a SAT solver and returns an LRAT certificate checked by the Lean kernel. The README reports zero `sorry`.
+
+| Theorem | Statement |
+|---------|-----------|
+| `add_sound` | For well-formed `a`, `b`: if `x` is in `a` and `y` is in `b` then `x + y` is in `add a b` |
+| `sub_sound` | Same for subtraction |
+| `and_sound` | Same for bitwise AND |
+| `add_wellFormed`, `sub_wellFormed`, `and_wellFormed` | Each operator's result is well-formed, for all inputs |
+| `mem_const`, `mem_unknown` | A constant contains itself; `unknown` contains every value |
+
+The soundness theorems assume well-formed inputs. The README notes that `bv_decide` produces concrete counterexamples to `add` and `sub` soundness on malformed tnums, so the well-formedness invariant is load-bearing; the `*_wellFormed` lemmas are what let the hypotheses compose across abstract execution.
+
+## What is not proven
+
+The README roadmap lists these as future work:
+
+1. Remaining tnum operators: `or`, `xor`, `lsh`, `rsh`, `arshift`, `mul`, `intersect`, `subsumes` (the last matters for pruning safety).
+2. The range domain and ALU transfer functions, plus the tnum and range product.
+3. Branch refinement.
+4. A small-step BPF semantics and the main soundness theorem that every accepted program runs without out-of-bounds access, stack overflow, division by zero, uninitialized reads or exceeding the instruction budget.
+
+## Running it
+
+```bash
+cd formal && lake build
+```
+
+The audit gate runs this as the `lean-build` step. In the `full` profile Lean is required; in `extended` the step is skipped if `lake` is not installed. The GitHub `lint-standalone-workspaces` job installs elan and runs `lake build` in `formal/`.
+
+## Related assurance
+
+Fuzzing the verifier (`verify_only`, `verify_then_exec`) and the host test suites are empirical checks on the Rust implementation; the Lean model checks the abstract-domain arithmetic only. See [Tests](/axiomos/v0.5.0-alpha.3/testing/tests).

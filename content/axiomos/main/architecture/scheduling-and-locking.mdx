@@ -1,0 +1,101 @@
+import { Callout } from 'nextra/components'
+
+# Scheduling & Locking
+
+**Relevant source files**
+
+- [docs/decisions/0001-runtime-scheduling-locking.md](https://github.com/pro-utkarshM/axiomOS/blob/main/docs/decisions/0001-runtime-scheduling-locking.md)
+- [kernel/src/mcore/mod.rs](https://github.com/pro-utkarshM/axiomOS/blob/main/kernel/src/mcore/mod.rs)
+- [kernel/src/mcore/mtask/scheduler/mod.rs](https://github.com/pro-utkarshM/axiomOS/blob/main/kernel/src/mcore/mtask/scheduler/mod.rs)
+- [kernel/src/mcore/mtask/scheduler/run_queue.rs](https://github.com/pro-utkarshM/axiomOS/blob/main/kernel/src/mcore/mtask/scheduler/run_queue.rs)
+- [kernel/src/mcore/mtask/scheduler/wait_channel.rs](https://github.com/pro-utkarshM/axiomOS/blob/main/kernel/src/mcore/mtask/scheduler/wait_channel.rs)
+- [kernel/src/mcore/mtask/scheduler/wait_protocol.rs](https://github.com/pro-utkarshM/axiomOS/blob/main/kernel/src/mcore/mtask/scheduler/wait_protocol.rs)
+- [kernel/src/mcore/mtask/scheduler/sleep.rs](https://github.com/pro-utkarshM/axiomOS/blob/main/kernel/src/mcore/mtask/scheduler/sleep.rs)
+- [kernel/src/mcore/mtask/task/state.rs](https://github.com/pro-utkarshM/axiomOS/blob/main/kernel/src/mcore/mtask/task/state.rs)
+- [kernel/crates/kernel_run_queue/src](https://github.com/pro-utkarshM/axiomOS/tree/main/kernel/crates/kernel_run_queue/src)
+- [kernel/src/arch/aarch64/interrupts.rs](https://github.com/pro-utkarshM/axiomOS/blob/main/kernel/src/arch/aarch64/interrupts.rs)
+- [kernel/src/syscall/mod.rs](https://github.com/pro-utkarshM/axiomOS/blob/main/kernel/src/syscall/mod.rs)
+
+The runtime rules are normative in [ADR-0001](/axiomos/main/decisions/adr-0001-scheduling-locking). This page describes what the code on `main` implements and where it still differs from the ADR.
+
+## Tasks and states
+
+A `Task` (`kernel/src/mcore/mtask/task`) belongs to a `Process` and is in one of `Ready`, `Running`, `Sleeping`, `Waiting` or `Finished`. Each CPU has an `ExecutionContext` holding its current task; the boot CPU becomes an idle task via `mcore::turn_idle()` (`hlt` / `wfi` loop).
+
+## Per-CPU run queues
+
+`kernel_run_queue` is the host-testable core shared by production and model tests: Cordyceps MPSC queues, a local-first dequeue policy, a rotating victim cursor, and a bounded steal loop.
+
+```mermaid
+flowchart TD
+    W["wake / spawn / preempted task"] --> EQ["RunQueues::enqueue: queue of task.last_cpu"]
+    EQ --> Q["per-CPU MPSC queue"]
+    D["reschedule on CPU n"] --> L{"local queue non-empty?"}
+    L -->|yes| RUN["take local task"]
+    L -->|no| ST["try_take_from up to MAX_STEAL_ATTEMPTS = 4 online victims"]
+    ST -->|found| RUN
+    ST -->|none| STAY["stay on current task"]
+    RUN --> SW["set last_cpu, mark Running, mark address space resident, run sched_switch BPF hook, context switch"]
+```
+
+- `victim_at(online_mask, local_cpu, ordinal)` excludes the local CPU and wraps over online CPUs, so one dequeue probes at most four real queues. A failed steal never spins on another CPU's queue.
+- No runnable task may be present in more than one queue; exact-once ownership is a Loom/model-test obligation.
+
+## The reschedule path
+
+`reschedule` ([scheduler/mod.rs](https://github.com/pro-utkarshM/axiomOS/blob/main/kernel/src/mcore/mtask/scheduler/mod.rs)) asserts interrupts are disabled, then:
+
+1. Disposes of the previous ("zombie") task: terminate-pending tasks go to `TaskCleanup`, `Sleeping` tasks to `TaskSleep`, `Waiting` tasks are parked through their wait registration, otherwise the task is marked ready and re-enqueued.
+2. Dequeues the next task (local first, then bounded steal). If none, it returns without switching.
+3. Records `last_cpu`, marks the task running, marks its address space resident on this CPU, and fetches CR3 (x86_64) or TTBR0 (AArch64). On x86_64 it updates the TSS `rsp0` to the next task's kernel stack.
+4. Builds a `SchedSwitchContext` (`cpu_id`, `prev_pid`, `prev_tid`, `next_pid`, `next_tid`) and runs BPF programs attached to `ATTACH_TYPE_SCHED_SWITCH`.
+5. Saves FPU state (`fxsave` on x86_64), restores TLS (`FsBase` or `TPIDR_EL0`), and hands the old/new stack pointers and page-table root to the assembly switch.
+
+## Timer tick
+
+On AArch64 the non-secure physical generic timer (PPI 14) fires every 10 ms (100 Hz, `cntfrq / 100`). The handler re-arms the timer, wakes expired sleepers via `TaskSleep::wake_expired`, and runs `ATTACH_TYPE_TIMER` BPF programs with a context that includes the measured vector-entry-to-handler latency (from `CNTVCT_EL0`) and boot metrics. On x86_64 the tick comes from the LAPIC (`kernel/src/mcore/lapic.rs`).
+
+## Waiting and sleeping
+
+`WaitChannel` is one lock-free primitive shared by timer, child-exit and pipe events. It owns a `WaitEpoch` (a generation counter), a `DrainGate`, and a sink of parked items. Waiters subscribe, observe the current generation, then park via a `WaitRegistration`; publishers call `wake_all`. Wake, cancellation and exit are generation-checked so a wake published between "check condition" and "park" is not lost.
+
+`sys_nanosleep` computes a monotonic deadline, calls `task.begin_sleep(deadline)` and reschedules with interrupts masked; it returns `EINTR` with the remaining time if woken early (for example by `SYS_INTERRUPT_SLEEP`).
+
+## Interrupt and preemption rules (ADR-0001)
+
+- Context-switch preparation runs with local interrupts masked and an exclusive, non-escaping scheduler borrow that ends before assembly transfers control. No blocking, allocation, filesystem operation or unbounded retry is allowed there.
+- Interrupt handlers never sleep, allocate, take a blocking lock, do filesystem I/O, or log synchronously. They may update bounded per-CPU state, publish a wake event and request rescheduling.
+- Task-context code registers a wait while holding the producer's condition lock, transitions to waiting, releases the lock, and only then reschedules.
+- Release builds compile all `log` macros out. Serial evidence for the audit gate needs `audit-diagnostics`; raw AArch64 UART probes need `bringup-diagnostics`. Neither is in a shipped profile.
+
+## Lock ranks
+
+Locks are acquired in strictly increasing rank (except a documented same-rank shard rule). The scheduler may consume owned handles prepared at lower ranks but must not acquire a lower-ranked lock while holding scheduler state; queue publication and wake APIs therefore take owned values rather than callbacks.
+
+| Rank | Class |
+|---:|---|
+| 10 | Process tree and global registries |
+| 20 | Process lifecycle and file-descriptor tables |
+| 30 | Address-space and memory-region state |
+| 40 | VFS namespace and filesystem state |
+| 50 | File, pipe and device object state |
+| 60 | BPF manager mutation state |
+| 70 | BPF map and execution leases |
+| 80 | Per-CPU scheduler / run-queue state |
+| 90 | Per-CPU trace and interrupt bookkeeping |
+
+<Callout type="warning">
+**Implementation gaps.** The ADR says debug/test builds assert the held-rank stack and that preemption-disabled sections nest through a CPU-local counter. A search of `kernel/src` on `main` finds no lock-rank assertion or preemption-count primitive, so treat those two items as policy enforced by review (the README also lists the missing `preempt_disable` primitive as issue #62). The reschedule IPI (decision 2) is explicitly **not implemented**: a remote wakeup enqueues to `last_cpu` and runs when that CPU next reschedules. Priority inheritance on kernel mutexes is also absent (#60).
+</Callout>
+
+## Future reschedule-IPI contract
+
+ADR-0001 fixes the contract an IPI implementation must follow before it may land:
+
+1. Destination policy belongs to the scheduler; the APIC/GIC layer only transports a bounded, non-blocking `request_reschedule(cpu)`.
+2. One scheduler-owned pending bit per target coalesces notifications; only the clear-to-set transition sends an IPI, and queue publication happens-before notification.
+3. The handler only acknowledges and latches a CPU-local reschedule request.
+4. The target clears the pending bit only at a scheduler boundary and then rechecks its queue (clear-then-recheck prevents lost wakeups).
+5. Masking delays delivery, not publication.
+
+It may be implemented only after a required SMP-4 regression (planned `qemu-smp4-scheduler-smoke`, not yet landed) passes **and** a repeatable measurement shows the no-IPI behavior misses an accepted wakeup-latency objective.

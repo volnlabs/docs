@@ -1,0 +1,82 @@
+import { Callout } from 'nextra/components'
+
+# Probes and Evidence
+
+**Relevant source files**
+
+- [docs/probes/2026-07-30-armv8a-risk-gate.md](https://github.com/volnlabs/voln-vp/blob/main/docs/probes/2026-07-30-armv8a-risk-gate.md)
+- [docs/probes/2026-07-30-phase2-virt-pi5-boot.md](https://github.com/volnlabs/voln-vp/blob/main/docs/probes/2026-07-30-phase2-virt-pi5-boot.md)
+- [docs/probes/2026-09-28-prebuilt-boot.md](https://github.com/volnlabs/voln-vp/blob/main/docs/probes/2026-09-28-prebuilt-boot.md)
+- [tools/probe-armv8a.sh](https://github.com/volnlabs/voln-vp/blob/main/tools/probe-armv8a.sh)
+- [renode/probes/stock-armv8a.resc](https://github.com/volnlabs/voln-vp/blob/main/renode/probes/stock-armv8a.resc)
+- [renode/probes/minimal-virt-stub.dts](https://github.com/volnlabs/voln-vp/blob/main/renode/probes/minimal-virt-stub.dts)
+- [TODO_NOW.md](https://github.com/volnlabs/voln-vp/blob/main/TODO_NOW.md)
+
+`docs/probes/` is a dated evidence log. Project rules in `TODO_NOW.md`: never fudge exit codes, never report PASS without a real artifact; an amber "FAIL with diagnostic" is normal and publishable, and only a HARD FAIL blocks.
+
+## Timeline
+
+| Date | Probe | Branch | Outcome |
+|---|---|---|---|
+| 2026-07-30 | Phase 1 ARMv8-A risk gate | `main` | PASS: CPU viability |
+| 2026-07-30 | Phase 2 `virt-pi5` boot | `main` | MMU resolved; userspace blocked by rootfs allocation panic |
+| 2026-09-28 | Prebuilt-image adapter verification | `main` | Adapters verified; Pi 5 and x86_64 guests fail; AArch64/RISC-V not validated |
+| 2026-09-30 | Identified AArch64 virt build | branch only | Blocked at guest link (`__kernel_end` undefined) |
+| 2026-09-30 | Virt linker fix + three boots | branch only | All three timed out (124) with empty UART |
+| 2026-10-01 | Renode model audit | branch only | No RP1/RP2040/BCM2712 models; warnings cannot prove strict coverage |
+| 2026-10-01 | RP1 PWM / GPIO / RIO / pad models | branch only | Native unit suites pass; no guest qualification |
+
+## Phase 1 risk gate (2026-07-30)
+
+Goal: prove axiomOS reaches UART on a stock Renode ARMv8-A platform before any custom Pi modeling.
+
+- Renode `1.16.1.16973`, stock `platforms/cpus/cortex-a78.repl` (UART `0x09000000`, GIC `0x08000000`, RAM `0x40000000`), DTB `renode/probes/minimal-virt-stub.dtb` loaded at `0x44000000`, ELF entry `0x40080000`.
+- `tools/probe-armv8a.sh` runs 0.1 virtual seconds under a 90 s wall timeout and requires both exit 0 and the marker `Logging initialized` (Renode 1.16 can exit 0 after Monitor errors).
+- Result: marker at about 1.0 ms virtual time; continued through exception vectors, physical memory, page tables, and heap init. Not a userspace claim.
+- Observations: early writes target the Pi UART `0x10_7d00_1000` (absent on that platform); post-heap high-half accesses were unmapped there, motivating Phase 2 board work.
+
+Decision: proceed to Phase 2; the "revisit backend choice" stop condition was not triggered.
+
+## Phase 2 `virt-pi5` boot (2026-07-30)
+
+Gate: the unmodified `embedded-rpi5` image must print `=== axiomos eBPF init ===` on `virt-pi5`.
+
+- The initial run entered at Renode's default EL3. axiomOS treats non-EL2 entry as EL1, so it programmed EL1 MMU registers while still at EL3, and high-half accesses went untranslated to the bus.
+- Fix: `cpu SetAvailableExceptionLevels false false` and `gic DisabledSecurity true`, plus PL011 handoff state. High-half warnings vanished; real MMU translation is exercised, with no Renode fork or address alias.
+- Current result:
+
+```text
+PI5_BENCH_FAIL stage=rp1_irq_route error=PcieLinkDown(0)
+kernel panicked ... memory allocation of 20971520 bytes failed
+```
+
+The first line is expected until a PCIe/RP1 model exists. The second is the userspace blocker: the 20 MiB embedded rootfs allocation exceeds the guest heap's usable contiguous capacity, an axiomOS issue.
+
+## Prebuilt-image adapter verification (2026-09-28)
+
+Reference axiomOS `main` at `b8953b59`, inspected read-only; no builds.
+
+| Check | Result |
+|---|---|
+| Rust CLI tests | 19 passed |
+| Adapter regression tests (stand-ins) | 12 passed |
+| Renode peripheral/platform tests | 5 passed |
+| `doctor`, shell syntax, whitespace | Passed |
+| Renode Pi 5 live boot | Fail: `V04_PANIC`, `memory allocation of 10485760 bytes failed`; exit 1 |
+| QEMU x86_64 live boot (QEMU 11.1.1) | Fail: `BOOT_FATAL code=root-filesystem-invalid`; exit 1 |
+| QEMU AArch64 live boot | Not validated: no identified compatible `virt` image |
+| QEMU RISC-V live boot | Not validated: demo ELF absent |
+
+Before this change, QEMU `test` exited zero even with nonexistent inputs. The real Renode run also confirmed that the positional script path needs escaped spaces while in-script paths need quoting. Input hashes were unchanged after the x86_64 run, confirming snapshots.
+
+<Callout type="warning">
+Adapter tests use stand-in emulators. No mocked success is a guest boot PASS.
+</Callout>
+
+## Later evidence (branch only)
+
+These probes exist on `fix/adapter-pid-readiness`, not `main`:
+
+- **Identified virt build (2026-09-30):** a clean clone of axiomOS `b8953b5` with `nightly-2026-07-02` built the 20 MiB rootfs, but the `virt,cloud-profile` kernel failed to link because `kernel/linker-virt.ld` omits `__kernel_end`.
+- **Linker fix (2026-09-30):** axiomOS PR #196 (commit `a6f48d1`) fixed the symbol and a validated manifest bundle was produced. Three QEMU runs (`virt-11.1,gic-version=2,virtualization=off,secure=off`, Cortex-A57, 1 GiB, semihosting off) each timed out after 30 s with empty UART. GDB showed `_start_asm` at `0x40080000` with `x0=0` storing to the Pi UART `0x107d001000`, after which PC jumps to `0x200`. The blocker is the Pi-specific early UART store on the virt entry path.
+- **Renode model audit and RP1 models (2026-10-01):** see [RP1 Models](/axiomos-sim/backends/rp1-models).

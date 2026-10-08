@@ -1,0 +1,70 @@
+import { Callout } from 'nextra/components'
+
+# Execution and JIT
+
+Relevant source files
+
+- [kernel/crates/kernel_bpf/src/execution/mod.rs](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/kernel/crates/kernel_bpf/src/execution/mod.rs)
+- [kernel/crates/kernel_bpf/src/execution/interpreter.rs](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/kernel/crates/kernel_bpf/src/execution/interpreter.rs)
+- [kernel/crates/kernel_bpf/src/execution/jit_aarch64.rs](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/kernel/crates/kernel_bpf/src/execution/jit_aarch64.rs)
+- [kernel/crates/kernel_bpf/src/execution/jit/mod.rs](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/kernel/crates/kernel_bpf/src/execution/jit/mod.rs)
+- [kernel/crates/kernel_bpf/src/profile/mod.rs](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/kernel/crates/kernel_bpf/src/profile/mod.rs)
+- [kernel/crates/kernel_bpf/Cargo.toml](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/kernel/crates/kernel_bpf/Cargo.toml)
+- [docs/decisions/0004-bpf-jit-policy.md](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/docs/decisions/0004-bpf-jit-policy.md)
+- [kernel/src/bpf/mod.rs](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/kernel/src/bpf/mod.rs)
+- [kernel/src/bpf/helpers.rs](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/kernel/src/bpf/helpers.rs)
+
+## The interpreter
+
+`Interpreter<P>` implements `BpfExecutor` and is the only execution engine on the shipped path. `BpfManager::execute_program` is the call site: it obtains the current CPU's execution context, borrows that CPU's BPF scratch stack, installs a per-execution `BpfExecution` record (used by helpers to resolve and lease maps), and calls `Interpreter::execute_with_stack`.
+
+Behaviour of `execute_with_stack`:
+
+- The stack slice must be at least `MAX_STACK_SIZE` bytes. Only the verifier-recorded stack suffix (`program.stack_size()`) is zeroed before each run, not a caller-supplied size.
+- `R1` holds a pointer to the `BpfContext`; `R10` points to the top of the stack.
+- A program counter loop executes ALU, jump, load, store, call and wide-load instructions. A run that executes more than `MAX_INSN_COUNT` instructions fails with `BpfError::Timeout`; an out-of-range pc is `OutOfBounds`.
+- Helper calls look the ID up in the verifier's shared descriptor table (`get_helper_descriptor`). An ID that the verifier knows but that has no runtime implementation returns `InvalidHelper`.
+- `BpfExecutor::execute` is a convenience wrapper that allocates a fresh stack; it is documented for tests, benchmarks and cold paths. The kernel hook path uses the reused buffer so that no heap allocation occurs on interrupt paths.
+- Nested BPF execution on one CPU is rejected with `ReentrantExecution`.
+
+`BpfContext` is `repr(transparent)` over a private raw record (`data`, `data_end`, `data_meta`, interrupt latency, boot time, heap KiB, image MiB). It carries a lifetime for the borrowed payload and is `!Send` and `!Sync`. Only layouts marked with the sealed `BpfPod` trait (the hook event structs) can be turned into a context with `from_struct`.
+
+Runtime errors (`BpfError`) include `DivisionByZero`, `OutOfBounds`, `StackOverflow`, `InvalidHelper`, `Timeout`, `InvalidInstruction`, `NotLoaded`, `OutOfMemory`, `ResourceLimit`, `ObjectBusy`, `PermissionDenied`, `ReentrantExecution`, `VerificationFailed`, `SignatureRejected`, `AdmissionRejected`, `GpioFanoutExceeded` and `ReadOnlyMap`.
+
+The default executor function `default_executor` always returns the interpreter ("for now, always return interpreter").
+
+## Profiles and execution
+
+Profiles are sealed, build-time constants (see [Overview](/axiomos/v0.5.0-alpha.3/bpf) for the table). For execution the relevant ones are `MAX_STACK_SIZE`, `MAX_INSN_COUNT`, and `JIT_ALLOWED`. Embedded and cloud both execute synchronously at the hook; the embedded profile additionally enforces the WCET and utilization budgets at load and attach time ([Verifier](/axiomos/v0.5.0-alpha.3/bpf/verifier)). Per `ARCHITECTURE.md`, there is no second BPF scheduler and no enqueueing: hooks execute matching programs inline from an immutable snapshot.
+
+Selecting a profile does not select an engine: `PhysicalProfile::JIT_ALLOWED` is `false` for both `CloudProfile` and `EmbeddedProfile`, and the profile test suite asserts it.
+
+## JIT policy (ADR 0004)
+
+[ADR-0004](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/docs/decisions/0004-bpf-jit-policy.md) (status: accepted, dated 2026-07-14) decides:
+
+- axiomOS v1.0 is interpreter-only. No shipped profile enables a JIT, and JIT is not on the release critical path.
+- Experimental JIT code must not provide kernel allocator symbols, executable mappings, or production call sites.
+- The existing AArch64 per-execution compiler and allocator path "will be removed from the shipped `kernel_bpf` surface or relocated to an experiment"; retaining it behind an undocumented feature is declared insufficient.
+- A future JIT needs a new superseding ADR and must satisfy six conditions: compile exactly once after verification and before publication; the verified program owns an immutable code image until epoch-safe unload; code is written into non-executable pages and transitioned once to read-only executable (never writable and executable together); compilation, allocation, protection changes and cache maintenance are fully fallible and transactional; hook dispatch performs no compilation, allocation, mapping or protection changes; and differential tests compare every supported instruction and helper with the interpreter, including malformed and resource-failure cases.
+
+The profile comments record the motivating audit finding (C-06): the earlier AArch64 cloud JIT used a 256 MiB RWX bump allocator, recompiled on every hook fire and never freed.
+
+### What the code still contains
+
+Compiler modules remain in the crate, so the repository state is slightly ahead of the ADR's intended end state:
+
+| Module | Gate | Notes |
+|---|---|---|
+| `execution/jit_aarch64.rs` (`Arm64JitCompiler`, `Arm64JitExecutor`) | `target_arch = "aarch64"` with the `experimental-aarch64-jit` feature, or `cfg(test)` | Declares extern `bpf_jit_alloc_exec`, `bpf_jit_free_exec` and `aarch64_jit_sync_cache`. A repository search found no definitions of these symbols outside the module itself, and `experimental-aarch64-jit` is not enabled by any manifest searched |
+| `execution/jit/mod.rs` (x86_64) | `cloud-profile` and `target_arch = "x86_64"` | Compiled into cloud x86_64 builds as a code generator; its source comments say executable memory handling would be done "in real impl", and nothing selects it for execution |
+
+The `Cargo.toml` comment for the feature states it is "excluded from every shipped profile until code images have an owned, compile-on-load RW-to-RX lifecycle". The module header in `execution/mod.rs` says the unsafe AArch64 JIT is erased from shipped builds. The kernel integration contains no RWX allocator.
+
+<Callout type="warning">
+Some comments in the tree predate the interpreter-only decision and should not be read as current behaviour. For example, a doc comment on `BpfManager::bench_execute` still says the production path is "JIT on AArch64, interpreter elsewhere", and the cost model comments refer to calibration against a "Pi5 JIT". The shipped executor is the interpreter; the WCET cost constants were calibrated in an earlier measurement and are not re-derived here.
+</Callout>
+
+## Related tests
+
+`tests/semantic_consistency.rs` checks that the same bytecode produces the same results across profiles, the `verify_then_exec` fuzz target checks that verified programs execute without panicking in the interpreter, and `tests/profile_contracts.rs` pins the externally visible profile constants. The unit tests in `interpreter.rs` use a `helpers_stub` module that provides the `extern "C"` helper symbols on the host.

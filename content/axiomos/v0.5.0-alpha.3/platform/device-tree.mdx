@@ -1,0 +1,55 @@
+import { Callout } from 'nextra/components'
+
+# Device Tree
+
+<details>
+<summary>Relevant source files</summary>
+
+- [kernel/src/arch/aarch64/dtb.rs](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/kernel/src/arch/aarch64/dtb.rs)
+- [kernel/src/arch/aarch64/boot.rs](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/kernel/src/arch/aarch64/boot.rs)
+- [kernel/src/arch/aarch64/phys.rs](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/kernel/src/arch/aarch64/phys.rs)
+- [kernel/src/arch/aarch64/mm.rs](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/kernel/src/arch/aarch64/mm.rs)
+- [kernel/src/arch/aarch64/platform/rpi5/memory_map.rs](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/kernel/src/arch/aarch64/platform/rpi5/memory_map.rs)
+- [kernel/src/arch/aarch64/platform/virt/mmio.rs](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/kernel/src/arch/aarch64/platform/virt/mmio.rs)
+- [kernel/src/driver/virtio/mmio.rs](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/kernel/src/driver/virtio/mmio.rs)
+
+</details>
+
+The README's platform table advertises "device tree boot" for AArch64. The code shows a narrower reality: the kernel parses the DTB **only to learn physical memory**. It does not use the device tree to discover or bind devices.
+
+## What the parser does
+
+`dtb::parse` in [`dtb.rs`](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/kernel/src/arch/aarch64/dtb.rs) is called once from `_start` with the physical address the firmware passed in `x0`. It uses the `fdt` crate.
+
+1. A null address returns `DtbParseError::NullAddress`.
+2. The first word is read volatile and must equal the FDT magic `0xd00dfeed` (big-endian), otherwise `InvalidMagic`.
+3. The total size is read from header offset 4, a slice of that length is created, and `Fdt::new` validates it (`InvalidBlob` on failure).
+4. `fdt.memory().regions()` is iterated. Up to **8** regions with nonzero size are stored as base and size; their sizes are summed into `total_memory`.
+5. The results are stored in a static `DeviceTreeInfo` holding `memory_regions`, `memory_region_count`, `total_memory`, `dtb_start` and `dtb_size`.
+
+Nothing else is read: no `compatible` strings, no `reg` properties of other nodes, no interrupt specifiers, no `chosen` node, no reserved-memory nodes, and no overlays.
+
+### Fallback
+
+If parsing fails, `parse` still records a hardcoded single region: base `0x4000_0000`, size 1 GiB, with an assumed DTB size of 64 KiB. Its log message calls this the fallback "for 'virt' machine". `_start` logs a warning and continues. On a Raspberry Pi 5, where RAM starts at `0x0`, this fallback region would not describe real memory, so a failed parse there is a real problem rather than a graceful degradation.
+
+## Who consumes the result
+
+| Consumer | Use |
+|---|---|
+| `phys::init_stage1` | Registers the DTB range as a reserved region so the allocator does not hand it out; seeds the physical allocator regions (up to 8 boot regions) |
+| `mm::init` | Reads `total_memory` to decide how many GiB of 1 GiB block mappings to create (at least 4 GiB, up to 512 entries) |
+
+## How devices are actually discovered
+
+| Platform | Mechanism |
+|---|---|
+| Raspberry Pi 5 | Hardcoded physical addresses in `rpi5/memory_map.rs` (GIC, UART10, RP1 window and offsets). No DT lookup; relies on firmware `config.txt` settings |
+| QEMU `virt` | Hardcoded addresses in `virt/mmio.rs` (PL011 at `0x0900_0000`, GIC, VirtIO MMIO at `0x0A00_0000`). The VirtIO scan probes all 32 fixed slots and checks the magic value instead of reading DT nodes |
+| x86_64 | No device tree. ACPI tables (RSDP from Limine) provide the IOAPIC and HPET, and PCI is found by brute-force configuration-space scan |
+
+The GIC bases in particular are compile-time constants from the platform module, not values from the `interrupt-controller` node.
+
+<Callout type="info">
+  Consequences of this design: a board revision or QEMU configuration that moves a peripheral requires a source change, and the DTB's `chosen`, `compatible` and interrupt-map information is ignored. If the project later adds DT-based discovery, this page should be updated; as of the reviewed source, `dtb.rs` is about 165 lines and memory-only.
+</Callout>

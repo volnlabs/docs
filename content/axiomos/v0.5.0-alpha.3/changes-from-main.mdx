@@ -1,0 +1,48 @@
+import { Callout } from 'nextra/components'
+
+# Release notes: release/v0.5.0-alpha.3
+
+**Relevant source files**
+
+- [docs/design/active/v0.5-runtime-evolution.md](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/docs/design/active/v0.5-runtime-evolution.md)
+- [docs/design/active/README.md](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/docs/design/active/README.md)
+
+<Callout type="info">
+`release/v0.5.0-alpha.3` is an **older snapshot of `main` plus one design document**. It is 2 commits ahead of `main` and 58 commits behind it. It branches from `main` at `78600068` ("Merge branch 'dev' into main", 2026-07-19); the branch head is `0567193e` (2026-07-20).
+</Callout>
+
+## What this release contains
+
+- **All code and docs on `main` as of `78600068`** (2026-07-19). The kernel, eBPF subsystem, platform support, userspace, firmware, tests and CI described elsewhere in this section are that snapshot.
+- **Two release-only commits**, both documentation:
+
+| Commit | Date | Change |
+|---|---|---|
+| `36518dfe` | 2026-07-19 | `docs: specify v0.5 runtime evolution`: adds `docs/design/active/v0.5-runtime-evolution.md` and lists it in `docs/design/active/README.md` |
+| `0567193e` | 2026-07-20 | `docs: adding design edits`: expands the design document to its final 1,144-line form |
+
+The design document specifies the v0.5 behavior registry, atomic hot-swap, rollback and flight recorder, and names this branch as its implementation contract. **None of it is implemented on this branch.** See [v0.5 Runtime Evolution](/axiomos/v0.5.0-alpha.3/design/v0.5-runtime-evolution).
+
+On `main`, the design document is not present at `docs/design/active/`; `main` instead carries `docs/plans/active/v0.5-runtime-evolution-engineering-draft-v2.md`.
+
+## Main-only changes this release lacks
+
+The 58 commits on `main` after the branch point (2026-07-19 to 2026-09-13), grouped by area:
+
+| Area | What `main` has that this release lacks | Representative commits |
+|---|---|---|
+| Raspberry Pi 5 GPIO interrupts | RP1 GPIO interrupts delivered to the GIC (`rp1_irq.rs`), handler-only GPIO IRQ census, removal of bring-up diagnostic dumps | `26e5ce5d`, `99c922d9`, `03a4137f` |
+| Pi 5 actuation and PWM | GPIO-level reflex output, RP1 PWM0 clock scaffolding, GPIO override release on peripheral handoff, reflex pulses gated on capture and control e-stop, local actuation timestamped before logging | `cf38b5d1`, `0b33d489`, `5302a0be`, `421439ba`, `34fe92c9` |
+| Benchmark serial path | Deferred bench UART buffer (`kernel/src/serial/bench_buffer.rs`), console-loss diagnostics, opt-in control-link poll tracing | `421439ba`, `07770852`, `55221ff1` |
+| v0.3 hardware-in-the-loop | GPIO23 probe harness, Gate 0 cold-boot runner, V03-A/B/C/D markers, reducers and corpora, retained v0.3 evidence under `docs/performance/evidence/hil-v03-20260724/`, sample correlation | `f6c4c081`, `f7674d4e`, `f5fee96a`, `2942eea0`, `7ca6ba56`, `f9ebc645` |
+| v0.4 benchmark markers | v0.4 markers, `analyze-v04.py` reducer, behavior runner, dispatch cleanup and review fixes | `08db8f8d`, `8c225c92`, `d56f5d58`, `95222b79`, `1874799e`, `f38a6798`, `759d0d34`, `35d4a40f` |
+| Live PWM HIL | Guarded one-shot PWM bring-up, live clamp and invalid-channel capture, varied containment requests, 6 MHz single-boot corpus, e-stop edge capture, waveform handling fixes, stimulus and preflight gating | `c4035bfd`, `5ec29540`, `7d9c5f64`, `9b7d63b4`, `566e58ff`, `43be1640`, `d043ce7e`, `493f91d7`, `ad685924` |
+| Shrike firmware and FPGA | Shrike Lite R0.4 board profile, guarded UF2 flash recovery and verification, ForgeFPGA runtime gate, fail-closed FPGA handoff and link-loss handling, FPGA lifecycle simulation tests, vendored Vicharak Shrike sources | `825a9778`, `69f75d30`, `1ac9e922`, `8d9e7610`, `1baf20e6`, `ebe3262a`, `e012f724`, `f7a662d7`, `876a4ebc` |
+| eBPF correctness | Interpreter stack provenance preserved across accesses, adjacent storage distinguished from stack end, verifier validates wide loads before memory instructions | `97bdd2ff`, `d87e8121`, `b8953b59` |
+| x86_64 | Correct xAPIC IPI destination encoding | `cb5bddb7` |
+| Build and CI | Deterministic embedded rootfs for reproducible images, fallback rootfs time pinned on Ubuntu CI, repaired release builds and QEMU smoke, refreshed hardware gate metadata | `664cd196`, `135e53bc`, `6d5b2b0c`, `4f5aa903` |
+| Tests | Isolated PMM fault injection | `9ef58f52` |
+| Documentation | Hardware validation and benchmarking runbook and wiring sheets (`docs/operations/`), HIL runtime-development gate, runtime plans, architecture review, paper artifacts, v0.5 FPGA baseline results (`docs/reviews/releases/2026-09-12-v0.5-fpga-baseline/`), reorganized docs | `1c8a3397`, `0c134204`, `a57b540d`, `05e2b257` |
+| Merges | Merges of `fix/v04-prerequisites` (#36) and `hil/v03-v04-20260720` (#37) | `7d8d094a`, `66f65859`, `acd56b03` |
+
+Pages in this section describe the release state; where `main` behaves differently, the `main` documentation applies to `main` only.

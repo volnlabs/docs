@@ -1,0 +1,59 @@
+import { Callout } from 'nextra/components'
+
+# Runtime Scenarios
+
+**Relevant source files** (branch `fix/adapter-pid-readiness`; not on `main`)
+
+- [docs/contracts/runtime-scenarios.md](https://github.com/volnlabs/voln-vp/blob/fix/adapter-pid-readiness/docs/contracts/runtime-scenarios.md)
+- [backends/renode/adapters/run.sh](https://github.com/volnlabs/voln-vp/blob/fix/adapter-pid-readiness/backends/renode/adapters/run.sh)
+- [backends/renode/tests/native-runner.robot](https://github.com/volnlabs/voln-vp/blob/fix/adapter-pid-readiness/backends/renode/tests/native-runner.robot)
+- [cli/src/backend.rs](https://github.com/volnlabs/voln-vp/blob/fix/adapter-pid-readiness/cli/src/backend.rs)
+- [cli/src/cli/mod.rs](https://github.com/volnlabs/voln-vp/blob/fix/adapter-pid-readiness/cli/src/cli/mod.rs)
+
+<Callout type="info">
+Not on `main`. On `main`, `test` is boot smoke only.
+</Callout>
+
+## Modes
+
+| Mode | Selection | Success criterion |
+|---|---|---|
+| `boot` (default) | `test` or `test --mode boot` | Startup marker, as on `main` |
+| `runtime` | `test --mode runtime --scenario /path/to/suite.robot` | Native Robot suite passes |
+
+The CLI forwards `VOLN_VP_TEST_MODE` and `VOLN_VP_SCENARIO`; a conflicting CLI value and inherited environment value fail. Runtime is valid only for `test`, requires a scenario, and rejects raw emulator arguments. Boot mode rejects a scenario. `--dry-run` prints the selection without validating it.
+
+**QEMU runtime** returns `unsupported` before launch: no guest management and completion interface is bound yet.
+
+## Renode execution
+
+```sh
+cargo run -- test --board virt-pi5 --mode runtime \
+  --scenario /path/to/suite.robot --artifact-manifest /path/to/bundle/build.json
+```
+
+Renode's native `renode-test` dependencies must be installed in the Python environment on PATH (`renode-test --help` must work); the adapter installs nothing. Checked against Renode `1.16.1.16973` and Robot `6.1`.
+
+The adapter stages guest inputs and a copy of the `.robot` suite in a fresh directory, then runs `renode-test` with one job, saved logs, and an isolated output directory. `${CURDIR}` is the staged directory, so suites must be standalone or use absolute paths. Imported resources are not staged or sealed. Robot suites can execute host code; run only trusted suites.
+
+| Robot variable | Value |
+|---|---|
+| `${AXIOMOS_KERNEL}` | Private staged kernel ELF |
+| `${VOLN_VP_DTB}` | Private staged DTB |
+| `${VOLN_VP_BOOT_SCRIPT}` | Generated `.resc` loading the Pi platform and inputs and attaching `uart.log` |
+| `${VOLN_VP_RUN_DIR}` | Fresh evidence directory |
+
+Use `Execute Script    ${VOLN_VP_BOOT_SCRIPT}` to load the platform. The script does not start emulation or impose `RunFor`; the suite owns readiness, guest commands, request-ID correlation, completion, and assertions. `VOLN_VP_TIMEOUT` bounds the whole native runner on the host; `VOLN_VP_VIRTUAL_TIME` has no effect in runtime mode.
+
+## What passes
+
+- The native runner exits zero.
+- After cleanup, fresh `robot_output.xml`, `log.html`, and `report.html` exist; the XML contains a passing suite with at least one test and every test passing.
+- Failed or skipped tests, missing results, XML errors, guest fatal output, and recorded emulator errors fail the adapter. The boot banner is never consulted.
+- With `VOLN_VP_STRICT_MMIO=1` (accepts `0` or `1`; unsupported for QEMU), any retained Renode warning also fails the run.
+
+A passing run proves only that the supplied suite passed. A suite that checks only readiness is not a runtime qualification suite. Concrete guest scenarios remain blocked on qualified artifacts and a pinned guest management interface. `qualification_claims` stays empty.
+
+## Installation self-check
+
+`backends/renode/tests/native-runner.robot` checks staged-variable delivery and executes a real Monitor assertion without loading a guest. Set `VOLN_VP_SELFTEST_EXPECTED=deliberately-absent` to invert its assertion; that run must return nonzero.

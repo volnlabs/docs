@@ -1,0 +1,109 @@
+import { Callout } from 'nextra/components'
+
+# Tools
+
+Relevant source files
+
+- [userspace/tools/bpf_loader/src/main.rs](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/userspace/tools/bpf_loader/src/main.rs)
+- [userspace/tools/signed_bpf_loader/src/main.rs](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/userspace/tools/signed_bpf_loader/src/main.rs)
+- [userspace/tools/rk_cli/src/main.rs](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/userspace/tools/rk_cli/src/main.rs)
+- [userspace/tools/rk_bridge/src/main.rs](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/userspace/tools/rk_bridge/src/main.rs)
+- [userspace/tools/rk_bridge/src/input.rs](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/userspace/tools/rk_bridge/src/input.rs)
+- [userspace/tools/rk_uart_forwarder/src/main.rs](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/userspace/tools/rk_uart_forwarder/src/main.rs)
+- [docs/architecture/protocols/rk-bridge.md](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/docs/architecture/protocols/rk-bridge.md)
+
+The tools split into two groups. `bpf_loader`, `signed_bpf_loader` and `rk_uart_forwarder` are guest binaries shipped in the rootfs. `rk` (the `rk_cli` package) and `rk_bridge` (binary `rk-to-ros`) are standalone host packages excluded from the kernel workspace.
+
+| Tool | Where it runs | Artifact (components.toml) |
+|------|---------------|----------------------------|
+| `bpf_loader` | Guest, `/bin` | `rootfs:bpf_loader` |
+| `signed_bpf_loader` | Guest, `/bin` | `rootfs:signed_bpf_loader` |
+| `rk_uart_forwarder` | Guest, `/bin` | `rootfs:rk_uart_forwarder` |
+| `rk_cli` | Host | `host:rk` |
+| `rk_bridge` | Host | `host:rk-to-ros` |
+
+## bpf_loader
+
+An end-to-end BPF demo using hand-assembled instructions, with a banner "axiomos BPF end-to-end demo: Maps + Ringbuf + Timer Attach". It runs five steps: create an array map for a tick counter (key 4 bytes, value 8, one entry), create a ringbuf, load a program that increments the counter and writes to the ringbuf, attach it to the timer, then poll until it has seen 10 events and read the counter back through `MAP_LOOKUP_ELEM`. It also exercises the privileged load and unload paths. It uses helpers such as map lookup, `ringbuf_output`, `trace_printk` and kernel heap statistics. It submits raw instructions through `BPF_PROG_LOAD`; whether the kernel accepts them depends on the signing policy of the build (see `signed_bpf_loader` for the signed-container path).
+
+## signed_bpf_loader
+
+The loader that `init` spawns in default (signed) builds.
+
+1. Opens `/var/lib/rkbpf/programs/startup.rbpf`. On failure prints `SIGNED_BPF_INPUT_MISSING` and exits 2.
+2. Reads up to 256 KiB. An empty or full buffer prints `SIGNED_BPF_INPUT_INVALID` (exit 4).
+3. Calls `BPF_PROG_LOAD_ELF` with the container bytes. A rejection prints `SIGNED_BPF_LOAD_REJECTED` (exit 5).
+4. On success prints `SIGNED_BPF_LOAD_OK` and parks in `pause()`.
+
+The container must be signed (Ed25519) and verified by the kernel against the embedded trust key. Bake one into the image with `AXIOM_SIGNED_BPF_STARTUP_PATH` at build time, as described in [Building](/axiomos/v0.5.0-alpha.3/getting-started/building). The input path comment notes that `rk deploy --program startup.rbpf` places the signed container here.
+
+## rk (rk_cli)
+
+A host CLI for signing and managing BPF programs. The package is `rk-cli`, the binary `rk`. Global flags are `-v/--verbose` and `-c/--config`. Configuration lives in `~/.config/rkbpf` (trusted keys in `trusted_keys`).
+
+| Command | Purpose |
+|---------|---------|
+| `rk key generate -o PREFIX` | New Ed25519 keypair, writes `PREFIX.pub` and `PREFIX.key` |
+| `rk key export -k FILE [-f pem or der or raw]` | Export a public key |
+| `rk key import -k FILE -a ALIAS` | Import a trusted public key |
+| `rk key list` | List trusted keys |
+| `rk sign -i OBJ.o -k KEY [-o OUT.rbpf]` | Sign a BPF object into a container |
+| `rk verify -i FILE.rbpf [-k PUB or -t TRUSTED_DIR]` | Verify a signed program |
+| `rk build -s SRC [-o DIR] [-p cloud or embedded]` | Build a BPF program (default profile `embedded`) |
+| `rk deploy -p FILE... [-t TARGET] [-a ATTACH]` | Deploy signed programs; target `localhost` (default), `ssh://user@host` or `user@host` |
+| `rk list`, `rk unload -p ID`, `rk info -i FILE` | Inspect and manage |
+| `rk init NAME [-p PROFILE]` | Scaffold a project |
+
+Deploy refuses files that do not start with the `RBPF` magic. Local deploy copies into `/var/lib/rkbpf/programs/` as `NAME.rbpf`. Signing uses `ring`.
+
+<Callout type="info">
+CI lints and tests `rk_cli` and `rk_bridge` as standalone workspaces. Whether the end-to-end sign, bake, boot loop is exercised on hardware is manual.
+</Callout>
+
+## rk_uart_forwarder
+
+A guest binary that opens the pinned `/sys/fs/bpf/maps/sched_switch_events` ringbuf with `BPF_OBJ_GET`, polls it with `BPF_RINGBUF_POLL` (backing off 10 ms when empty), and prints newline-delimited JSON to stdout. On the Pi, stdout is the UART when launched from `init`. If `BPF_OBJ_GET` fails it prints "run sched_switch_export_demo first" to fd 2 and exits 1. It emits a `meta` banner, a `ready` record, then one `sched_switch` record per event with a monotonically increasing `seq`. Protocol version is 1.
+
+## rk_bridge (rk-to-ros)
+
+A host program that bridges events to stdout or ROS2. It is its own Cargo package (with `[workspace]`) and has a fuzz target (`rk_bridge/fuzz`, `event_stream`).
+
+| Option | Default | Meaning |
+|--------|---------|---------|
+| `-m, --map PATH` | `/sys/fs/bpf/maps/sched_switch_events` | Pinned ringbuf (needs axiomOS `sys_bpf`) |
+| `-t, --topic` | `/rk/events` | ROS2 topic; with the default, events route to `/rk/imu`, `/rk/motor`, `/rk/safety`, `/rk/gpio`, `/rk/timeseries`, `/rk/sched_switch`, `/rk/trace` |
+| `--stdout` | off | Print instead of publishing |
+| `-f, --format` | `json-lines` | `json`, `json-lines` or `text` |
+| `-r, --rate-limit` | 0 | Events per second, 0 is unlimited |
+| `--poll-interval` | 10 | Milliseconds |
+| `--event-kind` | `sched-switch` | `legacy` or `sched-switch` |
+| `--input stdin` | none | Read JSON lines from stdin instead of a pinned object |
+| `--demo` | off | Synthetic events |
+
+Real ROS2 publishing requires the Cargo feature `ros2`, which uses the host `ros2` CLI and publishes `std_msgs/msg/String`. Without it, construction of the ROS publisher does not publish to a real graph.
+
+### Wire protocol
+
+The forwarder and `rk-to-ros --input stdin` talk over a line-oriented JSON protocol (`docs/architecture/protocols/rk-bridge.md`). It is deliberately minimal, a stopgap until a faster transport such as Ethernet exists.
+
+```bash
+# Host side
+socat /dev/ttyUSB0,raw,echo=0,b1500000 STDOUT \
+  | rk-to-ros --input stdin --topic /rk/sched_switch
+```
+
+```mermaid
+flowchart LR
+  K["Kernel sched_switch hook"] --> R["pinned ringbuf"]
+  R --> F["rk_uart_forwarder on Pi"]
+  F -->|"UART JSON lines"| H["rk-to-ros --input stdin"]
+  H --> T["stdout or ROS2 topic"]
+```
+
+| Record | Fields | Notes |
+|--------|--------|-------|
+| `meta` | `type`, `protocol` (u32), `source` | First record each session. Consumer aborts if protocol is not 1 |
+| `ready` | `type`, `map_fd` | Optional, after the pinned object is opened |
+| `sched_switch` | `type`, `seq`, `cpu`, `prev_pid`, `prev_tid`, `next_pid`, `next_tid` | `seq` is forwarder-assigned; `0` if absent |
+
+Consumer rules: skip lines not starting with `{`; tolerate unknown records and fields; treat a malformed line as recoverable; treat end of stream as clean. There is no reliability layer: the doc estimates a ceiling near 1500 events per second at 1.5 Mbit/s and notes that `seq` lets you detect, not recover, gaps. Serial-port input is a stated follow-up; only `stdin` is supported today.

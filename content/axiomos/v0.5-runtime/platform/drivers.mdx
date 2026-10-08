@@ -1,0 +1,190 @@
+import { Callout } from 'nextra/components'
+
+# Drivers and Control Link
+
+<details>
+<summary>Relevant source files</summary>
+
+- [kernel/src/driver/mod.rs](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/kernel/src/driver/mod.rs)
+- [kernel/src/driver/pci.rs](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/kernel/src/driver/pci.rs)
+- [kernel/src/driver/block.rs](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/kernel/src/driver/block.rs)
+- [kernel/src/driver/raw.rs](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/kernel/src/driver/raw.rs)
+- [kernel/src/driver/ram.rs](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/kernel/src/driver/ram.rs)
+- [kernel/src/driver/iio.rs](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/kernel/src/driver/iio.rs)
+- [kernel/src/driver/virtio/block.rs](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/kernel/src/driver/virtio/block.rs)
+- [kernel/src/driver/virtio/gpu.rs](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/kernel/src/driver/virtio/gpu.rs)
+- [kernel/src/driver/virtio/hal.rs](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/kernel/src/driver/virtio/hal.rs)
+- [kernel/src/driver/virtio/mmio.rs](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/kernel/src/driver/virtio/mmio.rs)
+- [kernel/src/file/devfs.rs](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/kernel/src/file/devfs.rs)
+- [kernel/src/serial.rs](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/kernel/src/serial.rs)
+- [kernel/src/serial/bench_buffer.rs](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/kernel/src/serial/bench_buffer.rs)
+- [kernel/src/watchdog.rs](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/kernel/src/watchdog.rs)
+- [kernel/src/actuation.rs](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/kernel/src/actuation.rs)
+- [kernel/crates/kernel_device/src/lib.rs](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/kernel/crates/kernel_device/src/lib.rs)
+- [kernel/crates/kernel_pci/src/lib.rs](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/kernel/crates/kernel_pci/src/lib.rs)
+- [kernel/crates/kernel_devfs/src/lib.rs](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/kernel/crates/kernel_devfs/src/lib.rs)
+- [kernel/crates/shrike_link/src/lib.rs](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/kernel/crates/shrike_link/src/lib.rs)
+- [kernel/src/arch/aarch64/platform/rpi5/control_link.rs](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/kernel/src/arch/aarch64/platform/rpi5/control_link.rs)
+- [kernel/crates/shrike_link/src/handoff.rs](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/kernel/crates/shrike_link/src/handoff.rs)
+- [kernel/crates/shrike_link/src/tx.rs](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/kernel/crates/shrike_link/src/tx.rs)
+- [kernel/src/arch/aarch64/platform/rpi5/control_link/rearm.rs](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/kernel/src/arch/aarch64/platform/rpi5/control_link/rearm.rs)
+- [firmware/shrike/control/src/transport.rs](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/firmware/shrike/control/src/transport.rs)
+- [firmware/shrike/control/src/requalification.rs](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/firmware/shrike/control/src/requalification.rs)
+- [firmware/shrike/rp2040/src/main.rs](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/firmware/shrike/rp2040/src/main.rs)
+- [firmware/README.md](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/firmware/README.md)
+- [firmware/shrike/README.md](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/firmware/shrike/README.md)
+- [firmware/shrike/fpga/README.md](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/firmware/shrike/fpga/README.md)
+
+</details>
+
+This page covers the device-model crates, the drivers in `kernel/src/driver`, the console and watchdog hooks, and the Shrike control link that connects the Pi 5 to an external RP2040/FPGA safety sidecar.
+
+## Device model
+
+Three small `no_std` crates under `kernel/crates` hold the portable part of the model; the kernel instantiates them with `KernelDeviceId`, a process-wide counter.
+
+| Crate | Contents |
+|---|---|
+| `kernel_device` | `Device` and `DeviceId` traits; `BlockDevice` trait with a const sector size (512 in the kernel); `RawDevice` trait (exposes a physical frame range) and `RawDeviceRegistry`; `RegisterDeviceError::AlreadyRegistered` |
+| `kernel_pci` | `PciAddress` (bus, device, function) with typed getters for vendor, device, header type, BARs and subsystem id; `ReadConfig`/`WriteConfig`/`ConfigurationAccess` traits; `PortCam` (x86 port I/O config access at `0xCF8`/`0xCFC`) |
+| `kernel_devfs` | `DevFs` filesystem implementing the `kernel_vfs` `FileSystem` trait; `DevFile` nodes `Null`, `Zero`, `Serial` and `BlockDeviceFile`; `ArcLockedDevFs` wrapper |
+
+## Driver availability by target
+
+| Driver | x86_64 | aarch64 `virt` | aarch64 `rpi5` |
+|---|---|---|---|
+| PCI bus scan and driver registry | Yes | No (module gated to x86_64) | No |
+| VirtIO block | Yes, over PCI | Yes, over MMIO | No |
+| VirtIO GPU | Yes, over PCI (draws a test pattern) | No | No |
+| Embedded RAM disk | No | No | Yes (root filesystem) |
+| IIO manager | Yes | Yes | Yes |
+| Serial console | COM1 16550 | PL011 | PL011 UART10 |
+| GPIO, PWM, control link | No | No | Yes ([RP1](/axiomos/v0.5-runtime/platform/rp1)) |
+
+## PCI and VirtIO (x86_64)
+
+`pci::init` in [`driver/pci.rs`](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/kernel/src/driver/pci.rs) scans all 256 buses and 32 slots with a port-I/O configuration access method, expands multifunction devices to 8 functions, and matches each address against `PCI_DRIVERS`. That registry is a `linkme` distributed slice: a driver registers a `PciDriverDescriptor` with a name, a type (`Generic` or `Specific`), a `probe` function and an `init` function.
+
+Selection rules:
+
+- A `Specific` driver wins over a `Generic` one.
+- Two matches of the same type is an error: the device is skipped and an "ambiguous PCI driver match" error is logged.
+- A failing `init` is logged and does not stop the scan.
+
+Registered drivers:
+
+| Driver | Match | Behavior |
+|---|---|---|
+| `virtio-blk` | vendor `0x1af4`, device `0x1000` to `0x103f`, subsystem `0x02` | Builds a VirtIO block device using the `virtio_drivers` crate and registers it as a block device |
+| `virtio-gpu` | vendor `0x1af4`, device `0x1050` | Sets up a framebuffer, fills it with a gradient pattern, flushes, and registers a `RawDevice` that exposes the framebuffer's physical frames |
+
+`virtio/hal.rs` implements the `virtio_drivers` `Hal` trait on the kernel's physical and virtual memory managers (DMA allocation, MMIO mapping, address translation).
+
+## VirtIO MMIO (QEMU `virt`)
+
+[`virtio/mmio.rs`](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/kernel/src/driver/virtio/mmio.rs), compiled only for `aarch64` with `virt`, probes 32 fixed slots from `0x0A00_0000` in `0x200`-byte steps. `MmioTransport::new` validates the magic value and version; empty slots are skipped silently. Only `DeviceType::Block` is initialized; other device types are recognized and ignored, and the source carries a TODO for network, console and GPU.
+
+## Block layer and devfs
+
+[`driver/block.rs`](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/kernel/src/driver/block.rs) keeps a global map of block devices. `BlockDevices::register_block_device` assigns a sequential id, publishes a node named `blkN` in the devfs (mounted at `/dev`, so it appears as `/dev/blkN`), and then inserts the device in the registry while holding the devfs write lock so the node cannot be observed before the registry entry. Errors are typed (invalid generated path, devfs failure) and the registry is unchanged on error. At boot the kernel looks up block device 0 and mounts it as an ext2 root filesystem.
+
+`RamBlockDevice` ([`driver/ram.rs`](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/kernel/src/driver/ram.rs)) is a 512-byte-sector block device backed by heap memory. On `rpi5` it is created from a disk image compiled into the kernel (`EMBEDDED_DISK_PATH`) and registered as block device 0. This is how the Pi 5 image gets its root filesystem today; there is no SD, NVMe or USB storage driver.
+
+`RawDevices` ([`driver/raw.rs`](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/kernel/src/driver/raw.rs)) registers raw devices in a registry; its own TODO notes that no VFS entry is created for them yet.
+
+The devfs is initialized in [`file/devfs.rs`](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/kernel/src/file/devfs.rs) with `/serial`, `/stdin` (a `Null` device), `/stdout` and `/stderr` (both `Serial` writers to the kernel console), under a source TODO for proper stdio. `Serial` is write-only: reads return end-of-file.
+
+## Serial console
+
+[`serial.rs`](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/kernel/src/serial.rs) provides `serial_print`/`serial_println` per architecture:
+
+- **x86_64:** a lazily initialized COM1 (`0x3F8`) 16550 port; interrupts are disabled around each write.
+- **aarch64 `rpi5`:** the PL011 UART10 `UART` global, with IRQs masked around the lock if they were enabled. In `bench` builds, once the bench is active, output goes to a **deferred buffer** instead (`bench_buffer.rs`): 16384 bytes, 1024-byte records, drained at most 64 bytes per timer tick with non-blocking sends. Overflow produces a `PI5_BENCH_LOG_LOSS` marker, and any loss invalidates serial-derived evidence.
+- **aarch64 `virt`:** the PL011 at `0x0900_0000`.
+
+## Industrial I/O (IIO)
+
+[`driver/iio.rs`](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/kernel/src/driver/iio.rs) is the sensor-event path that feeds BPF programs. Its header says that "in the future" it will interface with real I2C/SPI drivers and that for now it only provides the mechanism to inject sensor events and trigger BPF hooks. `IioManager` holds `IioDevice` entries with channels (for example `AccelX`, `AccelY`, `AccelZ`) and `dispatch_event` runs the attached IIO hooks.
+
+At boot `init_simulated_device` registers a **simulated accelerometer** (id 0). On x86_64 and non-Pi aarch64 builds a background task generates events; on `rpi5` that task is skipped on purpose so it does not preempt init or benchmarks. The `Sensor` frames arriving from the Shrike link are injected into IIO with a synthetic device id for an ultrasonic proximity channel; there is no real I2C or SPI sensor driver.
+
+## Watchdog
+
+[`watchdog.rs`](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/kernel/src/watchdog.rs) is ten lines: `trigger_estop` and `invariant_failed(reason)` log and call `actuation::watchdog_estop_trigger`, which latches the actuation monitor, applies safe-drive values to the outputs, notifies the control link to assert a soft e-stop, and prints a `V04_ESTOP ... source=watchdog` record. It is a software hook, not a hardware watchdog: the README lists "No hardware watchdog integration" (issue 72) under known limitations.
+
+## Actuation seam
+
+[`actuation.rs`](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/kernel/src/actuation.rs) is the single path through which actuation requests (`guard_pwm`, `guard_motor`, `guard_motor_pair`, `guard_gpio`, e-stop operations) are decided by a global monitor from `kernel_bpf::actuation` and then applied to RP1 MMIO or sent over the control link. The decision logic is a pure, host-tested crate; this file owns the global monitor, an `APPLY_LOCK` that is always taken with IRQs masked (it is reachable from both thread context and BPF hooks firing in IRQ context), and the MMIO application. Details of the policy belong to the BPF and safety documentation.
+
+## Shrike control link
+
+### What Shrike is
+
+From [`firmware/shrike/README.md`](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/firmware/shrike/README.md): "RP2040 safety/control sidecar and simulation." The hardware profile is Shrike-lite V1.0/R0.4, whose electrical sources are hash-pinned under `vendor/`, together with an upstream ForgeFPGA scaffold. So it is a board pairing an **RP2040 microcontroller** with a **ForgeFPGA**, not an FPGA soft core running axiomOS. Firmware lives outside the kernel workspace and is built and versioned separately.
+
+| Directory | Role |
+|---|---|
+| `firmware/shrike/control` | Platform-independent `no_std` control and motor state machines (`shrike_control`); on this branch also `transport.rs` (bounded whole-frame reverse UART ownership) and `requalification.rs` (explicit Requalify/Prepared session owner) |
+| `firmware/shrike/rp2040` | Physical RP2040 firmware and target config (`shrike_rp2040`); this branch adds real UART0 (`uart.rs`), SPI0 (`spi.rs`) and GPIO input (`inputs.rs`) adapters with register-model host tests |
+| `firmware/shrike/simulation` | Mock-HAL host simulation and state-machine tests (`shrike_rp2040_host_sim`) |
+| `firmware/shrike/fpga` | `shrike_safety_gate.sv` reference and testbench, plus the ForgeFPGA R0.4 project (RTL, pin plan, `clk_50mhz.sdc` / `clk_18ns_guard.sdc`) and the pinned MCU bitstream `axiomos_r04_mcu.bin` (46,408 bytes) |
+| `firmware/shrike/vendor`, `recovery` | Pinned vendor sources and recovery material |
+
+The README's R0.4 pin plan reserves RP2040 GPIO0 to 3 for FPGA SPI, GPIO12/13 for FPGA power and enable, GPIO14/15 for the post-configuration FPGA link and GPIO4 for the LED, with provisional assignments for the e-stop observe line (GPIO5), motor direction (GPIO6 to 9), ultrasonic (GPIO10/11) and the Pi UART (GPIO16/17).
+
+<Callout type="warning">
+  On this branch the default RP2040 firmware still owns the R0.4 FPGA pins but remains safe-low and non-operational. The opt-in `fpga-runtime` qualification build (`build-uf2.sh --runtime`) embeds the pinned nominal FPGA image and selects one explicit candidate timing profile; physical measurements decide whether that build can become a release artifact. The firmware owns UART0 on GPIO16/17 and performs a local 200 ms quiescence after inhibiting the FPGA; quiet never starts the controller, establishes a session or releases e-stop. GPIO14 is now a digital active-low FPGA runtime reset (held low at startup and by `force_safe`) rather than a PWM input. GPIO5 is read active-low with pull-down (low, open or read error means stopped) and GPIO10/11 are polled for trigger/echo with no enabled timing defaults. All of this is host/model and target-compile evidence; final wiring, timing and HIL qualification remain open (ADR-0003 "Supported after HIL").
+</Callout>
+
+### MCU runtime path (opt-in)
+
+The compile-checked runtime path receives an explicit `Requalify`, runs checked preparation (bounded local drain, FPGA configuration in reset state, a prioritized `Prepared` frame after whole-frame completion and UART TX idle), then starts the exact-session control loop through the single atomic FPGA pair sink. The SPI owner streams the SHA-256-verified, immutable `BitstreamImage` under one continuous CS-low interval, enforces SLG47910 startup minima and a 16 MHz configuration-clock ceiling, then performs a separate READY status read before runtime transactions (12-byte command plus two-byte post-commit status). Every wait has an absolute deadline and a finite poll cap so a frozen clock still terminates. Termination clears pending acquisition and inhibits/drains before accepting another request; it never resumes a controller by itself. See [Safe Handoff and Rearm](/axiomos/v0.5-runtime/runtime/handoff-and-rearm).
+
+### Final PWM authority
+
+Per the FPGA README, the FPGA generates the motor PWM from accepted signed commands and ignores the retained `*_pwm_in` pins. The physical e-stop is an active-low latching line routed directly to the FPGA and must not be generated by RP2040 firmware. A single invalid command disables both motors; e-stop assertion forces both outputs low combinationally; deassertion goes through a two-stage synchronizer and stays disarmed until a fresh, complete motor transaction arrives. The runbook's HIL step probes both outputs around a plus or minus 800 per-mille limit.
+
+### Wire protocol (`shrike_link`)
+
+[`kernel/crates/shrike_link`](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/kernel/crates/shrike_link/src/lib.rs) is the shared `no_std` crate used by both the kernel and firmware. Frame layout:
+
+```text
+SYNC(0x7E) VER(0x01) TYPE LEN PAYLOAD[LEN] CRC_LO CRC_HI
+```
+
+CRC16-CCITT/FALSE (polynomial `0x1021`, init `0xFFFF`) covers version through payload. Maximum payload is 16 bytes. The decoder is a byte-fed state machine; once `LEN` is accepted, payload and CRC are consumed by count, so `0x7E` inside a payload is data and no COBS framing is needed.
+
+| TYPE | Direction | Message |
+|---|---|---|
+| `0x01` | Pi to Shrike | `MotorSetpoint`: sequence, signed left and right duty in per-mille (not clamped by the codec) |
+| `0x02` | Pi to Shrike | `Estop`: advisory soft e-stop |
+| `0x03` | Pi to Shrike | `HeartbeatToShrike` |
+| `0x04` | Pi to Shrike | `SessionOffer`: nonzero u32 session (new) |
+| `0x05` | Pi to Shrike | `SafeBarrier`: u32 session, u64 correlation, u8 sequence (new) |
+| `0x06` | Pi to Shrike | `Requalify`: reserved nonzero u32 session; never authorizes motion (new) |
+| `0x81` | Shrike to Pi | `Sensor`: ultrasonic echo in microseconds, e-stop line state, flags |
+| `0x82` | Shrike to Pi | `HeartbeatToPi` |
+| `0x83` | Shrike to Pi | `SessionReady`: u32 session (new) |
+| `0x84` | Shrike to Pi | `SafeAck`: same fields as the barrier (new) |
+| `0x85` | Shrike to Pi | `Prepared`: MCU drained and FPGA configured in reset state for the session; not motion authority (new) |
+
+The codec does not clamp duty: the kernel actuation monitor and the FPGA envelope are the clamp authorities. Unknown-type frames with a valid CRC are consumed so the stream stays aligned.
+
+Other modules: `watchdog` (Shrike-side fail-safe: `SafeStop` on command silence, e-stop latch that dominates a simultaneous fresh setpoint, anti-replay by sequence number, cold-start `SafeStop`; heartbeats cannot restore motor authority), `session` (Pi-side liveness and heartbeat scheduling), `tx` (transmit state with motor-command priority, replacement and expiry; on this branch it also carries managed motor provenance, prioritizes handoff/session frames after any started frame and reports discards for the recorder), `handoff` (new: Pi-side session and safe-barrier correlation; a matching `SafeAck` after whole-frame TX yields a non-cloneable `SafeReceipt`), `installer` (new: the 16-byte debug-UART installer frame codec), `ring` (fixed byte ring buffer) and `motor` (per-mille to PWM and direction math; v0.4 is forward-only on the ARM-A path, reverse is deferred).
+
+### Kernel transport on the Pi 5
+
+[`control_link.rs`](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/kernel/src/arch/aarch64/platform/rpi5/control_link.rs) runs the transport in a dedicated kernel thread (`spawn()`, called from `main` after init) so RX side effects (IIO dispatch, e-stop) and motor TX happen in thread context where taking the BPF manager and apply locks is safe. In `managed-runtime` images the poller and the CPU0 timer additionally share one bounded handoff state: the timer inhibits and requests a barrier at a release boundary, the poller frames it and matches replies, and the resulting receipt is consumed at the next eligible release. Managed startup first runs the bounded PL011 local reset/quiescence path and discards reset-era bytes; cold initialization rejects invalid baud, RX errors and busy hardware and invokes trusted stop on failure without retrying. Receive errors, overflow, peer e-stop, inbound timeout and handoff failures retain specific stop causes. Explicit rearm (command 269) is coordinated by `control_link/rearm.rs`.
+
+| Parameter | Value |
+|---|---|
+| UART | RP1 UART0, GPIO14/15, 115200 baud, `Pl011` driver, polled |
+| RX ring | 256 bytes; per-poll caps of 64 bytes RX and 64 bytes TX |
+| Inbound-silence timeout | 80 ms (kept below the 100 ms RP2040 link timeout noted in the source) |
+| Heartbeat period | 20 ms (50 Hz) while alive |
+| Motor channels | Actuation chip 0, channel 1 = left, channel 2 = right; other channels keep local RP1 PWM |
+| Failure behavior | Fail-closed: link replaces local PWM for mapped channels; send of the safe motor pair is available |
+
+Inbound `Sensor` frames feed the IIO hook and the hardware e-stop path; outbound motor commands are the monitor-clamped values. Public helpers are `link_alive`, `rx_overflow_count`, `send_motor_pair`, `send_safe_motor_pair`, `command_estop` and `send`. Side effects run after the link lock is released to avoid nesting with the BPF manager or apply lock.
+
+The runbook's section 4.3 is the verification plan: flash only the reviewed RP2040 binary, capture startup, framing, watchdog/fail-safe, invalid-frame and loss-of-link behavior with motors disconnected, and confirm that e-stop and out-of-range commands yield a motor-disabled state before any powered test. The repository documents these as pending checklist items, not as completed results.

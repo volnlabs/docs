@@ -1,0 +1,123 @@
+import { Callout } from 'nextra/components'
+
+# Running in QEMU
+
+Relevant source files
+
+- [src/main.rs](https://github.com/pro-utkarshM/axiomOS/blob/main/src/main.rs)
+- [scripts/run/virt.sh](https://github.com/pro-utkarshM/axiomOS/blob/main/scripts/run/virt.sh)
+- [scripts/run/riscv.sh](https://github.com/pro-utkarshM/axiomOS/blob/main/scripts/run/riscv.sh)
+- [scripts/debug/qemu-triage.sh](https://github.com/pro-utkarshM/axiomOS/blob/main/scripts/debug/qemu-triage.sh)
+- [scripts/test/smoke-bpf.sh](https://github.com/pro-utkarshM/axiomOS/blob/main/scripts/test/smoke-bpf.sh)
+- [docs/operations/boot.md](https://github.com/pro-utkarshM/axiomOS/blob/main/docs/operations/boot.md)
+- [docs/operations/debugging/ring3-triage.md](https://github.com/pro-utkarshM/axiomOS/blob/main/docs/operations/debugging/ring3-triage.md)
+- [CONTRIBUTING.md](https://github.com/pro-utkarshM/axiomOS/blob/main/CONTRIBUTING.md)
+
+Two QEMU configurations are supported for running a full image: x86_64 with OVMF and the Limine ISO, and AArch64 `virt`. A third, a standalone RISC-V demo kernel, exists but is not the full kernel.
+
+## x86_64
+
+```bash
+cargo run                         # same as: cargo xtask run x86_64
+cargo run -- --headless           # no display; serial on stdio
+cargo run -- --smp 2 --mem 1G     # CPU count and RAM
+cargo run -- --debug              # QEMU GDB server on localhost:1234, frozen at start
+cargo run -- --no-run             # build only and print artifact paths
+```
+
+Runner options are defined by the `Args` struct in `src/main.rs`:
+
+| Flag | Default | Effect |
+|------|---------|--------|
+| `--debug` | off | Adds `-S`; QEMU waits for a debugger. Also writes a `debug.lldb` file in debug builds |
+| `--headless` | off | Adds `-nographic` |
+| `--smp N` | 4 | Number of emulated CPUs |
+| `--mem SIZE` | `4G` | RAM, for example `17M` or `4G` |
+| `--no-run` | off | Print `KERNEL_BINARY`, `BOOTABLE_ISO`, `DISK_IMAGE` and exit |
+
+### What the runner launches
+
+`qemu_command` builds a `qemu-system-x86_64` command with these properties:
+
+- Serial on stdio (`-serial stdio`) and a telnet monitor on port `45454`. Override with `AXIOMOS_QEMU_MONITOR_PORT`, or disable with `AXIOMOS_QEMU_DISABLE_MONITOR`.
+- `-s` always (GDB stub on `:1234`); `-S` only with `--debug`.
+- OVMF code as read-only pflash and OVMF vars as a snapshot, so firmware NVRAM never mutates.
+- The Limine ISO as `-cdrom`, and the ext2 rootfs as a `virtio-blk-pci` disk.
+- `-cpu max`, `-vga none`, and `--no-reboot` so a panic or triple fault exits instead of looping and clobbering the boot log.
+- `-accel kvm` on Linux x86_64 hosts, so `/dev/kvm` must be accessible.
+
+<Callout type="info">
+The kernel prints `QEMU_BOOT_OK` on the serial console after the userspace `init` process is created. Scripts and CI grep for this marker. The kernel then idles forever, so a healthy boot does not exit on its own.
+</Callout>
+
+### BPF smoke check
+
+```bash
+scripts/test/smoke-bpf.sh
+```
+
+This boots the kernel headless (timeout `BOOT_TIMEOUT`, default 540 s) and checks the serial log for `program loaded with id`, `attached prog 0 to type 7` and `Pinning ringbuf map object`. It fails on `rejected by verifier`, `VerificationFailed`, `wrong type` or any panic. It requires `/dev/kvm`.
+
+## AArch64 QEMU virt
+
+```bash
+export AXIOM_BPF_TRUSTED_KEY_PATH=/path/to/32-byte-ed25519.pub
+cargo xtask run virt
+```
+
+`scripts/run/virt.sh` does the following:
+
+1. Validates that the key file is exactly 32 bytes.
+2. Builds the root package for `aarch64-unknown-none` with `aarch64_deps` to produce the rootfs, using a unique `AXIOM_ARTIFACT_PATHS` file to find the exact `DISK_IMAGE`.
+3. Prints SHA-256 values of the disk image and trust key.
+4. Builds the kernel with `--features virt,cloud-profile`.
+5. Runs `qemu-system-aarch64 -machine virt -m 1G -cpu cortex-a57 -nographic` with the kernel ELF, the disk as `virtio-blk-device`, and semihosting, under a 600 s timeout.
+
+The target manifest classes AArch64 virt as experimental with no production compatibility claim.
+
+## RISC-V demo
+
+```bash
+cargo xtask build riscv
+cargo xtask run riscv
+```
+
+This builds `kernel/demos/riscv` and runs it under `qemu-system-riscv64 -machine virt`. The script notes that the full kernel port is still in progress. Exit QEMU with Ctrl+A then X.
+
+## Debugging a ring-3 page fault
+
+`scripts/debug/qemu-triage.sh`, reached with `cargo xtask debug qemu`, is a developer-only helper (it is not part of the audit gate). It was written to triage a ring-3 page fault at `0x2a00000012` that reproduces with the system OVMF from `edk2-ovmf 202602-3` but not with the pinned OVMF used by the gate.
+
+```bash
+# Default: system OVMF, --smp 1, --mem 1G, 120 s timeout
+cargo xtask debug qemu
+
+# Add validated breakpoints
+cargo xtask debug qemu -- \
+    --break kernel::arch::idt::page_fault_handler
+
+# Baseline with the pinned OVMF
+cargo xtask debug qemu -- --ovmf pinned
+```
+
+In a second terminal attach GDB with the generated `.gdbinit` (see `docs/operations/debugging/ring3-triage.md`) and press `c` to start the guest.
+
+| Option | Meaning |
+|--------|---------|
+| `--ovmf system or pinned or PATH` | OVMF firmware; default `system` |
+| `--ovmf-vars PATH`, `--system-ovmf-code PATH`, `--system-ovmf-vars PATH` | Firmware variable overrides |
+| `--break SYMBOL`, `--break-file FILE:LINE`, `--break-addr 0xHEX` | Repeatable; validated against the exact kernel ELF; at most four hardware breakpoints |
+| `--smp N`, `--mem SIZE` | Defaults 1 and `1G` |
+| `--timeout SECONDS`, `--capture-timeout SECONDS`, `--gdb-port-timeout SEC` | Watchdogs; defaults 120, equal to timeout, 10 |
+| `--rebuild-runner` | Force rebuild of the cached runner |
+| `--capture` | Drive batch GDB and write `triage-evidence.txt` under `target/triage-ovmf/runs/` |
+
+Exit codes: 0 capture completed with a hit, 2 usage error, 3 incomplete capture, 127 missing tool or firmware. The script verifies that the kernel ELF given to GDB is SHA-256 identical to the one inside the ISO.
+
+<Callout type="warning">
+The script invokes `qemu-system-x86_64` directly rather than through the runner, because the runner bakes OVMF paths in at compile time. Any change to the runner QEMU arguments must be mirrored in the script.
+</Callout>
+
+## Manual GDB or LLDB
+
+With `cargo run -- --debug`, attach GDB to `localhost:1234`. In debug builds the runner also writes `debug.lldb`, which targets the kernel binary, connects with `gdb-remote localhost:1234`, and sets breakpoints on `kernel_main` and `handle_panic`.

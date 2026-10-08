@@ -31,7 +31,7 @@ export default async function RootLayout({ children }) {
             </Navbar>
           }
           pageMap={pageMap}
-          docsRepositoryBase="https://github.com/volnlabs/volnlabs-docs/tree/main"
+          docsRepositoryBase="https://github.com/volnlabs/docs/tree/main"
           footer={<Footer>MIT {new Date().getFullYear()} © volnlabs</Footer>}
         >
           {children}

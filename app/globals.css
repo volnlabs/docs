@@ -1,0 +1,18 @@
+.branch-switcher {
+  padding: 4px 8px;
+  border: 1px solid rgb(0 0 0 / 0.2);
+  border-radius: 6px;
+  font-size: 14px;
+  color: #111;
+  background: #fff;
+  color-scheme: light;
+}
+.dark .branch-switcher {
+  color: #eee;
+  background: #111;
+  border-color: rgb(255 255 255 / 0.2);
+  color-scheme: dark;
+}
+/* native popup: keep option text readable in both themes */
+.branch-switcher option { color: #111; background: #fff; }
+.dark .branch-switcher option { color: #eee; background: #111; }

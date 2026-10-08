@@ -29,7 +29,7 @@ export function BranchSwitcher({ pages }: { pages: Record<string, string[]> }) {
         // same page on other branch if it exists, else branch root
         router.push(pages[e.target.value]?.includes(target) ? target : `/axiomos/${e.target.value}`)
       }}
-      className="x:rounded x:border x:px-2 x:py-1 x:text-sm x:bg-transparent"
+      className="branch-switcher"
     >
       {BRANCHES.map(b => (
         <option key={b.slug} value={b.slug}>

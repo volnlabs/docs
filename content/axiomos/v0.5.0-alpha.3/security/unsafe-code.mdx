@@ -1,0 +1,58 @@
+import { Callout } from 'nextra/components'
+
+# Unsafe-Code Audit
+
+**Relevant source files**
+
+- [docs/security/unsafe-code/README.md](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/docs/security/unsafe-code/README.md)
+- [docs/security/unsafe-code/ledger.toml](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/docs/security/unsafe-code/ledger.toml)
+- [docs/security/unsafe-code/ledger.md](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/docs/security/unsafe-code/ledger.md)
+- [scripts/verify/unsafe-ledger.py](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/scripts/verify/unsafe-ledger.py)
+- [CONTRIBUTING.md](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/CONTRIBUTING.md)
+
+Every first-party Rust `unsafe` syntax site is an owned review obligation. `ledger.toml` is the maintained catalog (path rules, owners, invariants); `ledger.md` is generated from it plus the current source by `python3 scripts/verify/unsafe-ledger.py --write`. Review and CI run `cargo xtask check unsafe`; `--list` prints a per-site TSV (location, construct, owner, invariant, callers, tests, priority, review date).
+
+## Snapshot
+
+**675 sites in 120 files**: 146 attributes, 421 blocks, 25 externs, 61 functions, 21 impls, 1 trait. Counts are syntactic source sites (including tests and fuzz targets, excluding build output and corpora), not expanded macro instances and not a proof of soundness. The inventory is fingerprinted (`sha256:9b42266d...`) so drift is detected.
+
+## Obligations
+
+| Obligation | Sites | Priority | Invariant (abridged) | Missing evidence called out |
+|---|---:|---|---|---|
+| AARCH64-EXCEPTION-CONTEXT | 85 | P0 | Assembly context layouts match `repr(C)`; vectors preserve registers | Nested exception and SMP interrupt stress |
+| TEST-HARNESS | 83 | P3 | Synthetic pointers confined to test/fuzz binaries | (harness is the evidence) |
+| SCHEDULER-TASK | 59 | P0 | One mutable owner of task/CPU state; context pointers pinned | Loom/model tests, forced preemption at mutation points |
+| AARCH64-PLATFORM-MMIO | 48 | P1 | MMIO matches DT/platform map; volatile, width-correct access | Register-level mocks, concurrent ownership tests |
+| BPF-EXECUTION-JIT | 45 | P0 | Only `VerifiedProgram` reaches execution; W^X for generated code | JIT differential tests, enforced RW-to-RX lifecycle |
+| USERSPACE-ABI | 45 | P1 | Syscall asm obeys kernel ABI; ring buffers aligned and bounded | Miri for parsers, malformed ring/event inputs |
+| KERNEL-BOOT-RUNTIME | 40 | P1 | Bootloader pointers, linker symbols, allocator setup valid | Malformed boot metadata, backtrace-chain tests |
+| AARCH64-PAGING | 38 | P0 | Aligned, uniquely owned tables; TLB maintenance ordered | Map/unmap fault injection, multicore shootdown tests |
+| MEM-ADDRESS-SPACE | 35 | P0 | Page tables live under the address-space lock; user copies validate every page | Concurrency fault injection |
+| BPF-HELPERS | 31 | P0 | Verified helper args still refer to live regions at run time | Adversarial helper provenance, concurrent map lifetime |
+| SYSCALL-PRIMITIVES | 29 | P0 | `UserspacePtr` proves only numeric range; deref needs `UserMemory` | Targeted Miri |
+| X86-INTERRUPT-CONTEXT | 25 | P0 | Naked frames match Rust layouts; valid stacks/selectors | Nested interrupt, malformed-frame tests |
+| DMA-MMIO-DRIVERS | 25 | P1 | MMIO/DMA mapped for device lifetime; transport serialized | IOMMU/DMA fault injection, hot-unplug |
+| MEM-PHYSICAL | 14 | P0 | Frame allocator initialized once, never hands out aliased frames | SMP allocator stress, reserved-range fault injection |
+| SCHEDULER-RUN-QUEUE | 14 | P1 | Intrusive links preserve task uniqueness | SMP-4 wakeup/IPI integration |
+| FILESYSTEM-INTERIOR | 13 | P1 | Interior raw references do not outlive nodes | Concurrent close/read/unmount |
+| BPF-KERNEL-INTEGRATION | 10 | P0 | Registry preserves program, credential, quota, lifetime invariants | Model-checked reclamation |
+| MEM-KERNEL-RAW | 9 | P1 | Raw allocation uses live mapped memory with exact layout | Miri for host-capable primitives |
+| SYSCALL-BOUNDARY | 10 | P0 | Register values untrusted; memory only via bounded adapter | Full syscall fault matrix |
+| BPF-MAPS | 9 | P0 | Map pointers aligned, in-bounds, live; Send/Sync premises hold | Miri/Loom, unload-during-execution tests |
+| MEM-VIRTUAL | 3 | P0 | Released segments not double-released or overlapping | Transactional map/unmap integration tests |
+| RISCV-ARCH | 2 | P1 | Trap/context asm matches layouts (experimental demo) | Boot/trap integration |
+| SCHEDULER-WAIT-TRANSITION | 1 | P0 | Generation-stamped wait registration, IRQs masked across transition | (model + SMP smoke present) |
+| ACTUATION-MMIO | 1 | P1 | RP1 GPIO window mapped for kernel lifetime, singleton ownership | Concurrent ownership, MMIO fault injection |
+| FIRMWARE-MMIO | 1 | P1 | RP2040 peripheral singletons accessed exclusively | Hardware concurrency, timer wraparound |
+
+## Review policy
+
+- **P0** gates release until the premises are enforced in code and exercised through a fault or concurrency path. **P1** needs targeted tests before the subsystem is complete. **P2** is platform/ABI glue with documented external premises. **P3** is test/tooling only.
+- The path rule is the durable owner; a new path containing `unsafe` fails `--check` until classified, and any count drift fails `--check`.
+- "Boot smoke" is integration evidence, not a substitute for provenance, aliasing, lifetime, mapping, interrupt, DMA or MMIO tests. Rows that say coverage is missing remain open audit debt.
+- Contributor rule: every `unsafe` block needs a `SAFETY:` comment.
+
+<Callout type="info">
+The BPF-EXECUTION-JIT obligation still exists because JIT code remains in the tree (`kernel_bpf/src/execution/jit_aarch64.rs`, `execution/jit`), even though no shipped profile enables it. ADR-0004 calls for removing or relocating it precisely because dead `unsafe` code adds audit surface.
+</Callout>

@@ -1,23 +1,24 @@
-# Nextra Docs Template 
+# volnlabs docs
 
-This is a template for creating documentation with [Nextra](https://nextra.site).
+Docs for [axiomOS](https://github.com/pro-utkarshM/axiomOS), [rbpf](https://github.com/volnlabs/rbpf) and [axiomos-sim](https://github.com/volnlabs/voln-vp). Built with [Nextra 4](https://nextra.site).
 
-[**Live Demo →**](https://nextra-docs-template.vercel.app)
+```sh
+npm install
+npm run dev     # http://localhost:3000 → /axiomos/main
+npm run build   # also builds the Pagefind search index
+```
 
-[![](.github/screenshot.png)](https://nextra-docs-template.vercel.app)
+## Layout
 
-## Quick Start
+- `content/axiomos/<branch>/` — one docs tree per axiomOS branch (`main`, `v0.5-runtime`, `fpga-bringup`, `v0.5.0-alpha.3`)
+- `content/rbpf/`, `content/axiomos-sim/` — single-version docs
+- `components/Branch.tsx` — navbar branch switcher + non-main banner
 
-Click the button to clone this repository and deploy it on Vercel:
+## Adding an axiomOS branch
 
-[![](https://vercel.com/button)](https://vercel.com/new/clone?s=https%3A%2F%2Fgithub.com%2Fshuding%2Fnextra-docs-template&showOptionalTeamCreation=false)
+1. `cp -r content/axiomos/main content/axiomos/<slug>` and rewrite `/axiomos/main/` links to `/axiomos/<slug>/`.
+2. Add `<slug>: { type: 'page', title: '<git ref>' }` to `content/axiomos/_meta.ts`.
+3. Add a row to `BRANCHES` in `components/Branch.tsx` and the slug to the list in `app/layout.tsx`.
+4. Add a `changes-from-main.mdx` page.
 
-## Local Development
-
-First, run `pnpm i` to install the dependencies.
-
-Then, run `pnpm dev` to start the development server and visit localhost:3000.
-
-## License
-
-This project is licensed under the MIT License.
+`zod` is pinned to 4.1.12 via `overrides`: zod 4.6 breaks Nextra 4.6.1's layout prop validation.

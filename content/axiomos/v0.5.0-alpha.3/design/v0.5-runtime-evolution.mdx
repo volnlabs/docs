@@ -1,0 +1,153 @@
+import { Callout } from 'nextra/components'
+
+# v0.5 Runtime Evolution (Design)
+
+**Relevant source files**
+
+- [docs/design/active/v0.5-runtime-evolution.md](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/docs/design/active/v0.5-runtime-evolution.md)
+- [docs/design/active/README.md](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/docs/design/active/README.md)
+- [kernel/crates/kernel_bpf/src/concurrency/epoch_snapshot.rs](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/kernel/crates/kernel_bpf/src/concurrency/epoch_snapshot.rs)
+
+<Callout type="warning">
+**Planned design, not implemented in this release.** This specification was added on the release branch (commits `36518dfe` and `0567193e`, 2026-07-19/20). None of the types or operations it defines (`BehaviorId`, `VersionId`, `SingleCoreBehaviorEpoch`, `FlightRecordV1`, the behavior registry, or the lifecycle ABI) exist in the code at `release/v0.5.0-alpha.3`. The document's front matter marks it `status: active`, `contract-version: 1`, `release-branch: release/v0.5.0-alpha.3`.
+</Callout>
+
+## Purpose and claim
+
+v0.5 turns a *behavior* into an explicit, signed, versioned runtime object instead of an unstructured collection of loaded BPF programs. The kernel must publish a verified behavior without rebooting, retain one known predecessor for manual rollback, and keep a bounded audit trail tying lifecycle changes to actuation decisions.
+
+The release claim is deliberately narrow:
+
+> Behavior changes atomically without rebooting, with deterministic computational rollback and an auditable execution trace.
+
+| Term | Means | Does not mean |
+|---|---|---|
+| Atomic | A hook observes one complete immutable dispatch snapshot | |
+| Deterministic computational rollback | The predecessor resumes its preserved private software state | Bumpless transfer, physical-state continuity, safety for arbitrary controllers |
+| Auditable execution trace | Ordered lifecycle and actuation evidence | Deterministic replay (inputs, timing, helper results and map mutations are not recorded) |
+
+The document is the implementation contract for `release/v0.5.0-alpha.3`; it states the release cannot be called complete while any acceptance criterion is unmet.
+
+## Scope
+
+**In scope:** a bounded kernel-resident behavior registry; the lifecycle `Verified` / `Resident` / `Active` / `Retired`; atomic publication of an immutable dispatch snapshot; manual rollback to the immediate predecessor; version-private maps and state; exclusive ownership of registry-managed attach keys; a bounded boot-lifetime flight recorder; inspection, export, typed failures and compare-and-swap lifecycle operations; unit, model, Miri, QEMU, fault-injection and hardware evidence.
+
+**Out of scope:** shadow/divergence-gated promotion, state-migration programs, shared maps between versions, bumpless transfer, contract-subtyping admission, automatic rollback, anti-rollback epochs, transparency logs, attestation, fleet rollout, multicore behavior activation, persistent recorder storage, deterministic replay, any physical-safety claim, and scheduler policy replacement.
+
+## Compatibility boundary
+
+- The verifier, signed-program authentication, WCET admission, process capabilities, authority lattice and actuation reference monitor (ARM-A) stay load-bearing; registry operations must compose with them.
+- The existing `EpochSnapshot<T>` is the publication foundation; no second reclamation algorithm may be added.
+- The kernel stays structurally multicore (`MAX_CPUS` unchanged); only behavior activation is limited to exactly one online CPU.
+- Legacy unmanaged BPF hooks keep their bounded fan-out on keys the registry does not own; existing program and map handles keep their ABI.
+- The dispatch and actuation hook path stays allocation-free and never takes the registry lock.
+
+## Identity model
+
+| Identity | Definition |
+|---|---|
+| `BehaviorId([u8; 16])` | Stable logical identity across versions, signed inside the manifest |
+| `VersionId([u8; 32])` | `SHA3-256("axiomos.behavior-manifest.v1\0" ‖ deterministic_cbor(manifest))`; changes with any executable, state, map, binding, capability, WCET or ABI change |
+| `SlotId(u32)` | Kernel-local registry location; not stable across boots |
+| `BehaviorVersionHandle` | `{ slot_id, version_index: u16, generation: u64 }`; a slot whose generation would wrap is poisoned for the boot |
+| `SignerId` | `SHA3-256("axiomos.signer-id.v1\0" ‖ ed25519_public_key)`; provenance only, not part of `VersionId` |
+
+`semantic_version` is display metadata only. The signature message is `"axiomos.behavior-signature.v1\0" ‖ VersionId`.
+
+## Manifest
+
+`BehaviorManifestV1` is RFC 8949 deterministic CBOR with integer keys and a frozen CDDL schema (schema version, behavior ID, semantic version, programs, maps, requested capabilities, declared WCET, minimum kernel ABI, critical extensions, extension fields). Decoders reject indefinite lengths, duplicate keys, non-minimal integers, floats, invalid UTF-8, unknown top-level fields, unknown critical extensions, and values over the resource limits. Program hashes must cover the exact bytes the verifier checks and the executor runs.
+
+Each resident version stores `AdmissionEvidenceV1` (signer, kernel build and ABI, verifier version, policy ID, program hashes, granted capabilities, admitted WCET, registration time). Trust, caller capabilities and e-stop state are revalidated on activation and rollback.
+
+## Fixed resource bounds (embedded profile)
+
+| Limit | Value |
+|---|---|
+| `MAX_BEHAVIOR_SLOTS` | 8 |
+| `MAX_VERSIONS_PER_SLOT` | 3 (active, predecessor, staged) |
+| `MAX_PROGRAMS_PER_VERSION` | 8 |
+| `MAX_ATTACH_BINDINGS` | 64 |
+| `MAX_MAPS_PER_VERSION` | 16 |
+| `MAX_MANIFEST_BYTES` | 65,536 |
+| `MAX_PROGRAM_BYTES` | 800,000 per program |
+| `MAX_SNAPSHOT_ENTRIES` | 64 |
+| `MAX_PENDING_RECLAIMS` | 4 |
+| `FLIGHT_RECORD_CAPACITY` | 4,096 |
+| `FLIGHT_RECORD_SIZE` | 160 bytes |
+
+Registration fails with `CapacityExceeded` rather than evicting a version. Capacity failures map to `ENOSPC`.
+
+## Lifecycle
+
+```text
+Verified ──register──► Resident ──activate──► Active
+                           ▲                    │
+                           └──swap/rollback─────┘
+                           └────retire────► Retired
+```
+
+- Every version owns its mutable maps; maps are never shared between versions.
+- An outgoing Active version becomes Resident with its state frozen; rollback resumes exactly that state.
+- `Active → Retired` is invalid; a Retired version never returns. Retiring the predecessor clears rollback availability.
+- `retire_behavior` returns `Retired`, `PendingQuiescence` or `AlreadyRetired`.
+
+## Attach keys and dispatch
+
+One active slot owns a registry-managed attach key at a time; activation replaces all of a slot's bindings atomically, and conflicts fail before publication with `AttachConflict`. Each `DispatchEntry` carries `attach_key`, `slot_id`, `behavior_id`, `version_id`, `dispatch_epoch` and the program runtime, so the hook path never queries the mutable registry for identity.
+
+`SingleCoreBehaviorEpoch` wraps `EpochSnapshot<T>` behind a `behavior-runtime-single-core` feature (compile-time exclusive with a future `behavior-runtime-smp`). Activation and rollback return `UnsupportedCpuTopology` unless exactly one CPU is online. Readers run inside a no-preemption guard; publication is split into `publish_without_reclaim` and `try_reclaim` so the writer never waits for readers.
+
+## Activation transaction
+
+The release-store of the new snapshot pointer is the single linearization point. Everything fallible happens before it:
+
+1. **Prepare:** authenticate, canonicalize, hash, verify, build runtimes, maps, the replacement snapshot and the recorder record; confirm capacity.
+2. **Commit:** take the registry lock; recheck topology, `expected_active`, slot/generation, Resident state, signer trust, caller authority, policy, attach ownership, capacity, counters and the e-stop latch; with interrupts and preemption masked, publish the pointer, commit metadata and append the record; release the lock; attempt reclamation.
+
+`activate_behavior` and `rollback_behavior` take an `expected_active` handle (compare-and-swap; mismatch returns `ActiveVersionChanged`). Rollback uses the same validation path. After publication, the result is always committed; pending reclamation is a status, not an error.
+
+While e-stop is asserted: register, inspect, read/export recorder and retire are allowed; activate and rollback are rejected; there is no clear operation in any state.
+
+## Flight recorder
+
+A bounded, overwrite-oldest, boot-lifetime ring of fixed 160-byte `FlightRecordV1` records with an export header (`boot_id`, build ID, oldest/next sequence, saturating `overwritten_total`). Writers are serialized under the single-core boundary with a commit-word protocol; readers double-check the commit sequence to reject torn records. Reads behind the oldest record report an explicit gap. Every actuation request gets a `correlation_id` matched by exactly one `ActuationGranted`, `ActuationClamped` or `ActuationRejected` event. Other events cover registration, activation, rollback, retirement, rejected operations and e-stop assert/release. No storage I/O happens in a hook or commit section, and no persistence is claimed.
+
+## Control-plane operations
+
+`register_behavior`, `activate_behavior`, `rollback_behavior`, `retire_behavior`, `get_behavior_slot`, `list_behavior_slots`, `get_behavior_version`, `read_flight_records`, `export_flight_recorder`. Mutations require explicit caller authority. Typed errors include `InvalidManifest`, `IdentityConflict`, `SignatureRejected`, `VerificationRejected`, `AdmissionRejected`, `PermissionDenied`, `CapacityExceeded`, `UnsupportedCpuTopology`, `InvalidTransition`, `StaleHandle`, `ActiveVersionChanged`, `AttachConflict`, `EstopLatched`, `CounterExhausted`, `ObjectBusy` and `OutOfMemory`.
+
+## Validation and hardware gate
+
+The plan requires CBOR/CDDL test vectors, lifecycle and epoch tests, Loom, Miri, QEMU, counter-exhaustion and fault-injection gates, plus a canonical Raspberry Pi 5 campaign:
+
+| Item | Requirement |
+|---|---|
+| Workload | One online CPU, 1 kHz timer hook, one IMU sample in, one PWM/motor request out through ARM-A, full recording |
+| Campaign | 100,000 transitions (50% activation, 50% rollback), randomized commit phase, recorder on/off A/B runs; development runs may use 10,000 |
+| Instrumentation | External GPIO cycle marker, second version marker, logic analyzer |
+| Correctness | Old snapshot before publication, new after; no mixed set, missing or duplicate cycle, unauthorized grant or torn record |
+| Transition | New behavior runs on the first eligible 1 kHz tick |
+| Commit timing | p99.9 `<` 100 µs, max `<` 250 µs, no 1 ms deadline miss |
+| Recorder | p99 hook-latency increase `<` 5%, zero loss in the canonical run |
+
+Evidence goes under `docs/performance/evidence/<commit>/` before summaries are published.
+
+## Implementation order
+
+1. Identity types, manifest encoding, signature envelope, limits, typed errors, test vectors.
+2. Bounded recorder and export contract.
+3. Snapshot publish/reclaim split and `SingleCoreBehaviorEpoch`.
+4. Registry, generation-safe handles, version-private state.
+5. Inspection and paginated listing.
+6. Activation, rollback, retirement, attach arbitration, revalidation, e-stop checks.
+7. ABI and CLI operations (no record-clear).
+8. Unit, property, Loom, Miri, QEMU, exhaustion and fault-injection gates.
+9. Integrate alpha.2 hardware support and alpha.3 runtime work.
+10. Run and retain the canonical 1 kHz hardware campaign.
+
+The document includes a "v0.5.0 — Runtime Evolution" completion statement that it says may only be published once every acceptance criterion and the hardware evidence are in place.
+
+## Rejected alternatives (selection)
+
+Content-addressed `BehaviorId`; semver-based equality; including signer identity in `VersionId`; mutating attachment vectors in place; waiting for reclamation inside publication; using `Arc` counts as a grace-period proof; changing kernel-wide `MAX_CPUS` to one; unbounded lifecycle history; automatic retirement for capacity; shared mutable maps; claiming deterministic replay; persisting the recorder in the hook path; implementing shadow/migration/subtyping now.

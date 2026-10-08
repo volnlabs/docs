@@ -1,0 +1,99 @@
+import { Callout } from 'nextra/components'
+
+# eBPF Subsystem
+
+Relevant source files
+
+- [kernel/crates/kernel_bpf/README.md](https://github.com/pro-utkarshM/axiomOS/blob/feat/fpga-bringup/kernel/crates/kernel_bpf/README.md)
+- [kernel/crates/kernel_bpf/src/lib.rs](https://github.com/pro-utkarshM/axiomOS/blob/feat/fpga-bringup/kernel/crates/kernel_bpf/src/lib.rs)
+- [kernel/crates/kernel_bpf/docs/ARCHITECTURE.md](https://github.com/pro-utkarshM/axiomOS/blob/feat/fpga-bringup/kernel/crates/kernel_bpf/docs/ARCHITECTURE.md)
+- [kernel/crates/kernel_bpf/docs/PROFILES.md](https://github.com/pro-utkarshM/axiomOS/blob/feat/fpga-bringup/kernel/crates/kernel_bpf/docs/PROFILES.md)
+- [kernel/src/bpf/mod.rs](https://github.com/pro-utkarshM/axiomOS/blob/feat/fpga-bringup/kernel/src/bpf/mod.rs)
+- [kernel/src/syscall/bpf.rs](https://github.com/pro-utkarshM/axiomOS/blob/feat/fpga-bringup/kernel/src/syscall/bpf.rs)
+- [docs/security/bpf-trust.md](https://github.com/pro-utkarshM/axiomOS/blob/feat/fpga-bringup/docs/security/bpf-trust.md)
+- [docs/decisions/0004-bpf-jit-policy.md](https://github.com/pro-utkarshM/axiomOS/blob/feat/fpga-bringup/docs/decisions/0004-bpf-jit-policy.md)
+
+The axiomOS eBPF subsystem lets user-supplied, verified bytecode run synchronously inside kernel hooks (timer tick, syscall entry and exit, scheduler switch, GPIO and IIO events). It is split into a `no_std` library crate, `kernel_bpf`, that provides mechanisms (loader, verifier, interpreter, maps, signing, actuation policy) and a kernel-side integration layer, `kernel/src/bpf`, that owns policy (authorization, quotas, handles, hook snapshots).
+
+Execution is interpreter-only. No shipped profile enables a JIT (see [Execution and JIT](/axiomos/fpga-bringup/bpf/jit-and-execution)).
+
+## Crate layout
+
+| Location | Role |
+|---|---|
+| `kernel/crates/kernel_bpf/src/bytecode` | Raw instructions, opcodes, registers, and the `BpfProgram` / `VerifiedProgram` representations |
+| `kernel/crates/kernel_bpf/src/loader` | ELF64 parser, relocations, subprogram call normalization |
+| `kernel/crates/kernel_bpf/src/verifier` | CFG, register/stack state, tnum, pruning, liveness, helper registry, WCET cost model, admission ledger |
+| `kernel/crates/kernel_bpf/src/execution` | Interpreter, `BpfContext`, hook context structs; non-shipped compilers |
+| `kernel/crates/kernel_bpf/src/maps` | Array, hash, ring buffer, time-series maps |
+| `kernel/crates/kernel_bpf/src/attach` | Attach metadata types (GPIO, IIO, PWM, kprobe, tracepoint) and the GPIO route table |
+| `kernel/crates/kernel_bpf/src/signing` | Signed container (`RBPF`) parsing and Ed25519 verification |
+| `kernel/crates/kernel_bpf/src/profile` | `CloudProfile` and `EmbeddedProfile` constants |
+| `kernel/crates/kernel_bpf/src/actuation` | ARM-A actuation reference monitor decision core |
+| `kernel/crates/kernel_bpf/src/concurrency` | `EpochSnapshot` used to publish hook snapshots |
+| `kernel/src/bpf` | `BpfManager`, `authorization`, `handles`, `limits`, `trust`, `snapshot`, `helpers` |
+| `kernel/src/syscall/bpf.rs` | `sys_bpf` command dispatch and capability gating |
+| `kernel/crates/kernel_abi/src/bpf.rs` | Command, map type, attach type, helper and capability constants shared with userspace |
+
+Tests and tooling live in `kernel/crates/kernel_bpf/tests` (integration, profile contracts, semantic consistency, concurrency model), `kernel/crates/kernel_bpf/fuzz` (four libfuzzer targets: `verify_only`, `verify_then_exec`, `signed_container`, `ringbuf_sequences`), and `kernel/crates/kernel_bpf/benches`.
+
+## Build-time profiles
+
+Exactly one of the `cloud-profile` or `embedded-profile` features must be enabled on `kernel_bpf`; enabling both or neither is a `compile_error!`. The profile is exposed as the `ActiveProfile` type alias.
+
+| Constant | Cloud | Embedded |
+|---|---:|---:|
+| Stack | 512 KiB | 8 KiB |
+| Max instructions | 1,000,000 | 100,000 |
+| Per-map profile budget | 0 (kernel quotas only) | 64 KiB |
+| `JIT_ALLOWED` | false | false |
+| Per-program WCET budget | unbounded | 1 ms period at 6 ns per unit (about 166,666 units) |
+| Utilization budget | unbounded | 500,000,000 ns per second |
+| Map resize methods | compiled | erased |
+
+See [PROFILES.md](https://github.com/pro-utkarshM/axiomOS/blob/feat/fpga-bringup/kernel/crates/kernel_bpf/docs/PROFILES.md) for the normative table.
+
+## Load-to-fire pipeline
+
+```mermaid
+flowchart TD
+    A["userspace: sys_bpf PROG_LOAD_ELF or PROG_LOAD"] --> B["capability gate: PROGRAM_LOAD"]
+    B --> C["authorization snapshot: caller tier, ACTUATE, map access"]
+    C --> D{"signature check: authenticate_with_provenance"}
+    D -->|"signed RBPF container: Ed25519 over SHA3-256"| E["unwrap inner ELF"]
+    D -->|"plain ELF, only if unsigned allowed"| E
+    D -->|"otherwise"| X1["reject: SignatureRejected"]
+    E --> F["BpfLoader: ELF parse, map defs, relocations"]
+    F --> G["normalize: inline subprogram calls into a flat program"]
+    G --> H["Verifier: basic checks, CFG, profile constraints, path exploration"]
+    H -->|"embedded"| I["static WCET against per-program budget"]
+    H --> J["register_program: quotas, generation-safe handle"]
+    J --> K["PROG_ATTACH: capability for attach type"]
+    K --> L["re-verify with exact hook context size"]
+    L --> M["admission ledger: sum of WCET times frequency"]
+    M --> N["publish immutable hook snapshot via EpochSnapshot"]
+    N --> O["hook fires: timer, sys_enter, sys_exit, sched_switch, GPIO, IIO"]
+    O --> P["Interpreter runs each program in the snapshot synchronously"]
+```
+
+Key properties, each described in detail on the linked pages:
+
+- Only verifier-produced `VerifiedProgram` values can reach the interpreter ([Verifier](/axiomos/fpga-bringup/bpf/verifier)).
+- Raw instruction loads carry no signature and are rejected whenever signature enforcement is active ([Trust Model](/axiomos/fpga-bringup/bpf/trust-model)).
+- Attach re-runs verification with the exact payload size for the hook and forbids logging helpers on latency-sensitive hooks ([Hooks](/axiomos/fpga-bringup/bpf/hooks)).
+- Hook dispatch reads a fixed-capacity immutable snapshot and takes no manager lock ([Hooks](/axiomos/fpga-bringup/bpf/hooks)).
+
+## Honest scope notes
+
+<Callout type="warning">
+The crate documentation states that the embedded profile does not provide an EDF BPF scheduler or a static allocator: admission is a utilization ledger, and all maps use checked heap allocation. Performance figures quoted in source comments (for example the 6 ns per WCET unit calibration) come from historical benchmark records; the source itself notes they are not claimed as current artifact-backed measurement. This documentation does not restate them as current results.
+</Callout>
+
+## Page map
+
+- [Loader](/axiomos/fpga-bringup/bpf/loader): ELF parsing, relocations, subprograms, `sys_bpf` commands
+- [Verifier](/axiomos/fpga-bringup/bpf/verifier): safety analysis, WCET, admission, limits
+- [Execution and JIT](/axiomos/fpga-bringup/bpf/jit-and-execution): interpreter, JIT policy
+- [Hooks](/axiomos/fpga-bringup/bpf/hooks): attach types and dispatch
+- [Maps and Helpers](/axiomos/fpga-bringup/bpf/maps-and-helpers): map types and helper table
+- [Trust Model](/axiomos/fpga-bringup/bpf/trust-model): signing, authorization, handles, quotas

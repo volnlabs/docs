@@ -1,0 +1,28 @@
+# Architecture
+
+**Relevant source files**
+
+- [docs/architecture/README.md](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/docs/architecture/README.md)
+- [docs/architecture/system-overview.md](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/docs/architecture/system-overview.md)
+
+The architecture section describes the implemented system on the unmerged `feat/v0.5-runtime` branch: subsystem boundaries, invariants, control flow, ownership and trust relationships. The branch adds an opt-in **managed runtime** (`managed-runtime` feature) for uploading, preparing, handing off and rolling back one signed 100 Hz controller; it is documented in its own [Managed Runtime](/axiomos/v0.5-runtime/runtime) section, and the pages here describe where it touches the existing kernel. The canonical v0.5 contract is [docs/plans/active/v0.5-bounded-runtime-evolution.md](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/docs/plans/active/v0.5-bounded-runtime-evolution.md).
+
+| Page | What it covers |
+|---|---|
+| [System Overview](/axiomos/v0.5-runtime/architecture/system-overview) | Layering, authority order, runtime ownership, known assurance limits |
+| [Boot Flow](/axiomos/v0.5-runtime/architecture/boot-flow) | Limine (x86_64) and firmware/DTB (AArch64) entry through `kernel::init` to `/bin/init` |
+| [Memory](/axiomos/v0.5-runtime/architecture/memory) | Physical allocator, heap sizing, `AddressSpace`, mapping transactions, TLB shootdown, user-copy boundary, fault policy |
+| [Kernel Crate Boundaries](/axiomos/v0.5-runtime/architecture/kernel-crates) | Which crate or `kernel/src` module owns each policy |
+| [Scheduling & Locking](/axiomos/v0.5-runtime/architecture/scheduling-and-locking) | Per-CPU run queues, wait protocol, lock ranks, interrupt rules |
+| [Build Ownership](/axiomos/v0.5-runtime/architecture/build-ownership) | Root runner and `build.rs` vs. `xtask` vs. `scripts/` |
+| [Protocols & ABI](/axiomos/v0.5-runtime/architecture/protocols) | Syscall ABI v1, `sys_bpf` commands (including the managed commands 256 to 269), rk-bridge JSON stream, Shrike-link UART frames (including session, barrier and requalification messages) |
+
+## Authority order
+
+When documents disagree, the repository resolves them in this order ([system-overview.md](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/docs/architecture/system-overview.md)):
+
+1. Generated authorities under `docs/reference/generated` (ABI, targets, components, artifacts, build inputs, quality).
+2. Accepted decisions under `docs/decisions`.
+3. Current architecture documents.
+4. Source code and its required gate evidence.
+5. Archived and legacy documents (historical only).

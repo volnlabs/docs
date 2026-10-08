@@ -1,0 +1,101 @@
+import { Callout } from 'nextra/components'
+
+# virt-pi5 (Renode)
+
+**Relevant source files**
+
+- [boards/virt-pi5/board.toml](https://github.com/volnlabs/voln-vp/blob/main/boards/virt-pi5/board.toml)
+- [boards/virt-pi5/renode/virt-pi5.repl](https://github.com/volnlabs/voln-vp/blob/main/boards/virt-pi5/renode/virt-pi5.repl)
+- [boards/virt-pi5/virt-pi5.dts](https://github.com/volnlabs/voln-vp/blob/main/boards/virt-pi5/virt-pi5.dts)
+- [boards/virt-pi5/virt-pi5.dtb](https://github.com/volnlabs/voln-vp/blob/main/boards/virt-pi5/virt-pi5.dtb)
+- [backends/renode/scripts/boot-virt-pi5.resc](https://github.com/volnlabs/voln-vp/blob/main/backends/renode/scripts/boot-virt-pi5.resc)
+- [backends/renode/peripherals/mailbox.py](https://github.com/volnlabs/voln-vp/blob/main/backends/renode/peripherals/mailbox.py)
+- [backends/renode/tests/test_platform_contract.py](https://github.com/volnlabs/voln-vp/blob/main/backends/renode/tests/test_platform_contract.py)
+
+`virt-pi5` is a Renode machine on the Raspberry Pi 5 (BCM2712) memory map, intended to run the unmodified axiomOS `embedded-rpi5` kernel.
+
+## Manifest
+
+```toml
+name = "virt-pi5"
+memory = "8GB"
+default_backend = "renode"
+backends = ["renode"]
+
+[memory_map]
+ram_start = "0x00000000"
+ram_size = "0x200000000"
+
+[peripherals]
+gic_distributor = "0x107fff9000"
+gic_cpu = "0x107fffa000"
+uart0 = "0x107d001000"
+mailbox = "0x107d00b880"
+
+[dtb]
+path = "boards/virt-pi5/virt-pi5.dtb"
+```
+
+## Platform (`virt-pi5.repl`)
+
+| Block | Renode model | Address / config |
+|---|---|---|
+| CPU | `CPU.ARMv8A`, `cortex-a78`, one core | GIC as interrupt controller |
+| Timer | `Timers.ARM_GenericTimer` | 54 MHz; EL3 phys to GIC 29, EL1 phys 30, EL1 virt 27, NS EL2 phys 26, NS EL2 virt 28 |
+| GIC | `IRQControllers.ARM_GenericInterruptController`, GICv2, two security states | Distributor `0x107fff9000` (0x1000), CPU interface `0x107fffa000` (0x2000) |
+| RAM | `Memory.MappedMemory` | `0x0`, size `0x200000000` (8 GiB) |
+| UART0 | `UART.PL011` | `0x107d001000`, IRQ 121 |
+| Mailbox | `Python.PythonPeripheral`, inline script | `0x107d00b880`, size `0x40` |
+
+The design spec called for 4x Cortex-A76 (A75/A78 acceptable). The implemented model uses one Cortex-A78 core deliberately: the Phase 2 probe notes that multi-core bring-up cannot resolve a single-core failure and makes the gate harder to diagnose.
+
+### Mailbox stub
+
+The mailbox models only the register handshake, not firmware property-buffer interpretation (current axiomOS does not issue those requests).
+
+| Offset | Register | Behavior |
+|---|---|---|
+| `0x00` | READ | Returns last written value if a response is pending, else 0; clears pending |
+| `0x18` | READ_STATUS | `0` when a response is pending, else `EMPTY` (bit 30) |
+| `0x20` | WRITE | Stores value, sets response pending |
+| `0x38` | WRITE_STATUS | Always 0 |
+
+The `.repl` embeds the script inline because Renode resolves external Python filenames relative to its installation root. `backends/renode/peripherals/mailbox.py` is the independently tested copy and must stay aligned.
+
+## Device tree
+
+`virt-pi5.dts` (compiled to the bundled `virt-pi5.dtb`) declares `compatible = "axiomos,virt-pi5", "raspberrypi,5-model-b"`, one `arm,cortex-a78` CPU with `spin-table`, 8 GiB memory at 0, a `arm,gic-400` interrupt controller, an `arm,armv8-timer` at 54 MHz, the PL011 `serial@107d001000` (48 MHz clock, 115200 baud) as `stdout-path`, and `mailbox@107d00b880` with `compatible = "axiomos,firmware-mailbox"`.
+
+## Boot script
+
+`boot-virt-pi5.resc` creates the machine and prepares direct-kernel entry:
+
+```text
+mach create
+machine LoadPlatformDescription @boards/virt-pi5/renode/virt-pi5.repl
+cpu SetAvailableExceptionLevels false false
+gic DisabledSecurity true
+uart0 WriteDoubleWord 0x30 0x301
+uart0 WriteDoubleWord 0x2c 0x40
+sysbus LoadFdt $virt_pi5_dtb 0x10000000 "dtb"
+sysbus LoadELF $axiomos_kernel
+cpu ResetVector 0x80000
+```
+
+- Renode ARMv8-A CPUs reset in EL3. The raw axiomOS kernel follows the QEMU direct-kernel contract and expects EL1, so EL3/EL2 are disabled before loading.
+- The PL011 control/line-control writes reproduce the state Pi firmware normally hands off.
+- The DTB is loaded at `0x10000000`; the kernel ELF entry is `0x80000`.
+
+`test_platform_contract.py` asserts that the EL1 setup precedes `LoadFdt`/`LoadELF`, that `gic DisabledSecurity true` is present, and that the platform has RAM at `0x0` of size `0x200000000` with no `ffff8000` high-address alias.
+
+<Callout type="warning">
+The canonical machine must exercise real MMU translation. `TODO_NOW.md` states no high-address alias is present, and any future alias must be experimental, opt-in, ineligible for semantic gates, and removed after use.
+</Callout>
+
+## Not yet modeled on `main`
+
+The BCM2712 PCIe root complex and the RP1 peripheral block are absent. The guest therefore logs `PI5_BENCH_FAIL stage=rp1_irq_route error=PcieLinkDown(0)`. Unit models for RP1 GPIO/RIO/pads and PWM exist only on unmerged branches and are not installed in this platform; see [RP1 Models](/axiomos-sim/backends/rp1-models).
+
+## Status
+
+Boot-to-userspace (TODO 2.13) is blocked by the guest: the kernel panics allocating its embedded rootfs (20 MiB in the July image, 10 MiB in the September image). See [Probes and Evidence](/axiomos-sim/probes).

@@ -1,0 +1,35 @@
+# ADR-0003: Supported Target and Feature Matrix
+
+**Relevant source files**
+
+- [docs/decisions/0003-supported-targets.md](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/docs/decisions/0003-supported-targets.md)
+- [docs/reference/generated/targets.md](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/docs/reference/generated/targets.md)
+- [ci/manifests/targets.toml](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/ci/manifests/targets.toml)
+- [kernel/src/lib.rs](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/kernel/src/lib.rs)
+- [kernel/demos/riscv](https://github.com/pro-utkarshM/axiomOS/tree/feat/v0.5-runtime/kernel/demos/riscv)
+- [scripts/verify/target-boundary.py](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/scripts/verify/target-boundary.py)
+
+**Status:** Accepted. **Date:** 2026-07-14.
+
+## Decision
+
+| Target | Triple | Status | Required release evidence |
+|---|---|---|---|
+| x86_64 QEMU/OVMF | `x86_64-unknown-none` | Supported | Build, strict lint, host suites, signed production boot, unsigned-development negative tests, SMP QEMU integration tests |
+| Raspberry Pi 5 | `aarch64-unknown-none` | Supported after HIL | Build, strict lint, production signing policy, physical boot, GPIO IRQ, control link, timer, storage and failure-state HIL |
+| AArch64 `virt` | `aarch64-unknown-none` | Experimental | Compile check only; not a production hardware claim |
+| RISC-V demo | `riscv64gc-unknown-none-elf` | Experimental standalone | Outside the production kernel and release artifact; compile/lint only, no compatibility claim |
+| Shrike RP2040 firmware | `thumbv6m-none-eabi` | Supported after HIL | Target lint/build, mock-HAL state-machine tests, physical control-link/watchdog/failsafe HIL |
+
+Feature policy:
+
+- Only `cloud-profile` and `embedded-profile` are shipped BPF limit sets. The generated target matrix maps x86_64 to `cloud-profile + x86_64_arch` and Pi 5 to `embedded-rpi5`.
+- Production images are **signed-only**. Unsigned BPF is an explicit development feature (`bpf-unsigned-development`) and must never appear in production provenance.
+
+## Consequences in code
+
+- The main kernel supports only x86_64 and AArch64. `kernel/src/lib.rs` contains a `compile_error!` for any other architecture, pointing to `kernel/demos/riscv`.
+- The alternate RISC-V manifest, entrypoints, linker script, feature, null allocator and dormant architecture module were retired from the main kernel.
+- Target tables and CI inventory are generated from the component manifest, not prose, and the required `target-boundary-static` check rejects drift back into the main kernel.
+
+See [Platform](/axiomos/v0.5-runtime/platform) for per-target details.

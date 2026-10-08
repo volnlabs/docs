@@ -1,0 +1,79 @@
+import { Callout } from 'nextra/components'
+
+# Testing Overview
+
+Relevant source files
+
+- [docs/operations/testing.md](https://github.com/pro-utkarshM/axiomOS/blob/main/docs/operations/testing.md)
+- [docs/operations/release-verification.md](https://github.com/pro-utkarshM/axiomOS/blob/main/docs/operations/release-verification.md)
+- [CONTRIBUTING.md](https://github.com/pro-utkarshM/axiomOS/blob/main/CONTRIBUTING.md)
+- [ci/README.md](https://github.com/pro-utkarshM/axiomOS/blob/main/ci/README.md)
+- [scripts/verify/engineering-audit.sh](https://github.com/pro-utkarshM/axiomOS/blob/main/scripts/verify/engineering-audit.sh)
+- [.github/workflows/build.yml](https://github.com/pro-utkarshM/axiomOS/blob/main/.github/workflows/build.yml)
+- [.github/workflows/fuzz.yml](https://github.com/pro-utkarshM/axiomOS/blob/main/.github/workflows/fuzz.yml)
+
+axiomOS testing is layered by what can be trusted at each level. Host tests cover everything extractable into `no_std` crates; QEMU smoke tests cover boot and in-guest probes; fuzzing and Miri cover adversarial and unsafe surfaces; Lean proofs cover a small slice of the verifier's abstract domain; and Raspberry Pi 5 behavior is validated manually.
+
+<Callout type="warning">
+There is no hardware-in-the-loop CI; Pi 5 testing is manual (README, issue 76). `docs/operations/release-verification.md` says a local pass must not be taken as physical HIL, independent review, a ForgeFPGA bitstream, or robot-level evidence.
+</Callout>
+
+## Strategy
+
+| Layer | What it checks | Where |
+|-------|----------------|-------|
+| Static policy | Formatting, clippy, unsafe-code ledger, inventory, boundaries, generated docs, ABI surface, error policy | `cargo xtask check ...`, `scripts/verify/*.py` |
+| Host unit and integration tests | Kernel subsystems extracted as crates (`kernel_bpf`, `kernel_vfs`, `kernel_elfloader`, and others) | `cargo test -p ...` |
+| Concurrency models | Loom models for the run queue and BPF epoch snapshot | `kernel_run_queue`, `kernel_bpf` |
+| Miri | Undefined behavior in unsafe code | `cargo miri test` per crate |
+| QEMU smoke | Boot reaches `QEMU_BOOT_OK`, `init` probes pass | audit gate, `scripts/test/smoke-bpf.sh` |
+| Fuzzing | Verifier, signed container, ring buffer, ELF loader, syscall arguments, bridge protocol | `cargo fuzz` |
+| Formal proofs | Tnum operator soundness in Lean | `formal/` |
+| Hardware validation | GPIO, e-stop, PWM, timing on real boards | `scripts/hil/`, manual runbook |
+
+The kernel binary cannot run standard Rust unit tests because it uses a custom linker script. CONTRIBUTING.md therefore asks that new functionality be extracted into separate host-testable crates where possible.
+
+## Gate flow
+
+```mermaid
+flowchart TD
+  C["Developer change"] --> Q["cargo xtask check all --profile quick"]
+  Q --> F["cargo xtask check all --profile full"]
+  F --> S["Static policy: fmt, unsafe ledger, inventory, docs, ABI"]
+  F --> H["Host tests: debug and release, bpf cloud and embedded"]
+  F --> M["Miri, loom models"]
+  F --> Z["QEMU smoke: smp 1, 2, 4"]
+  F --> L["Lean build"]
+  F --> R["Target checks: x86_64, AArch64, RP2040, RISC-V, FPGA RTL"]
+  S --> P["Retained run directory under artifacts/runs"]
+  H --> P
+  M --> P
+  Z --> P
+  L --> P
+  R --> P
+  P --> E["Optional: extended profile adds fuzz and hardware-facing checks"]
+  E --> HW["Manual Pi 5 HIL, separate evidence"]
+```
+
+## Commands
+
+From `docs/operations/testing.md`:
+
+```bash
+cargo xtask check inventory
+cargo xtask check boundary
+cargo xtask check docs
+cargo xtask check all --profile quick --no-qemu
+cargo xtask check all --profile full
+```
+
+Substantial runs retain the command, environment, commit, results, summary and logs under ignored `artifacts/runs/` directories.
+
+## Pages
+
+| Page | Covers |
+|------|--------|
+| [Tests](/axiomos/main/testing/tests) | Host tests, kernel tests, script tests, smoke, fuzzing |
+| [CI and gates](/axiomos/main/testing/ci) | Manifests, profiles, xtask checks, GitHub workflows |
+| [Formal verification](/axiomos/main/testing/formal-verification) | Lean tnum proofs |
+| [Hardware-in-the-loop](/axiomos/main/testing/hardware-in-the-loop) | HIL scripts and manual Pi 5 validation |

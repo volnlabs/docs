@@ -1,0 +1,105 @@
+import { Callout, Steps } from 'nextra/components'
+
+# Shrike RP2040 and FPGA Targets
+
+**Relevant source files**
+
+- [firmware/shrike/README.md](https://github.com/pro-utkarshM/axiomOS/blob/feat/fpga-bringup/firmware/shrike/README.md)
+- [firmware/shrike/fpga/README.md](https://github.com/pro-utkarshM/axiomOS/blob/feat/fpga-bringup/firmware/shrike/fpga/README.md)
+- [firmware/shrike/rp2040/Cargo.toml](https://github.com/pro-utkarshM/axiomOS/blob/feat/fpga-bringup/firmware/shrike/rp2040/Cargo.toml)
+- [firmware/shrike/rp2040/build-uf2.sh](https://github.com/pro-utkarshM/axiomOS/blob/feat/fpga-bringup/firmware/shrike/rp2040/build-uf2.sh)
+- [firmware/shrike/rp2040/flash-uf2.sh](https://github.com/pro-utkarshM/axiomOS/blob/feat/fpga-bringup/firmware/shrike/rp2040/flash-uf2.sh)
+- [firmware/shrike/rp2040/host-tests/test_flash_contract.py](https://github.com/pro-utkarshM/axiomOS/blob/feat/fpga-bringup/firmware/shrike/rp2040/host-tests/test_flash_contract.py)
+- [firmware/shrike/recovery/vicharak-763d0a7/SOURCE.toml](https://github.com/pro-utkarshM/axiomOS/blob/feat/fpga-bringup/firmware/shrike/recovery/vicharak-763d0a7/SOURCE.toml)
+- [scripts/verify/fpga-safety-gate.sh](https://github.com/pro-utkarshM/axiomOS/blob/feat/fpga-bringup/scripts/verify/fpga-safety-gate.sh)
+- [scripts/verify/fpga-build-evidence.py](https://github.com/pro-utkarshM/axiomOS/blob/feat/fpga-bringup/scripts/verify/fpga-build-evidence.py)
+- [docs/plans/active/shrike-fpga-bench.md](https://github.com/pro-utkarshM/axiomOS/blob/feat/fpga-bringup/docs/plans/active/shrike-fpga-bench.md)
+
+This page covers building and checking the two non-kernel targets on the Shrike-lite V1.0/R0.4 board: the RP2040 firmware (`thumbv6m-none-eabi`) and the ForgeFPGA safety gate. For what the FPGA does, see [Shrike FPGA Safety Gate](/axiomos/fpga-bringup/platform/fpga).
+
+<Callout type="warning">
+The RP2040 firmware on this branch owns the R0.4 FPGA pins but stays safe-low and non-operational. The `fpga-runtime` feature deliberately fails to compile until the concrete configuration/runtime adapter exists. Keep motors, drivers and motor power disconnected throughout electronics acceptance. No FPGA image has been programmed on this branch.
+</Callout>
+
+## Prerequisites
+
+| Need | For |
+|---|---|
+| `nightly-2026-07-02` toolchain with `thumbv6m-none-eabi` | RP2040 firmware (`build-uf2.sh` pins this toolchain) |
+| `iverilog` (or `verilator`) | RTL simulation |
+| Renesas Go Configure Software Hub (ForgeFPGA Workshop; the branch records Forge 6.55.001) and its bundled Yosys | Synthesis, place and route, bitstream, Yosys preflights |
+| Python 3 | Flash-contract tests, build-evidence verifier, bench observer |
+
+## RP2040 firmware
+
+<Steps>
+
+### Build
+
+`firmware/shrike/rp2040/Cargo.toml` now declares an empty `[workspace]`, so the firmware builds standalone even when the checkout is a nested worktree. Build from the firmware directory so the target linker configuration applies (the bench record excludes an earlier root-directory build that omitted it):
+
+```bash
+firmware/shrike/rp2040/build-uf2.sh
+```
+
+The script builds the release ELF, converts it with a pinned `elf2uf2-rs` 2.2.0, runs `verify_flash_contract.py`, and writes a `.sha256` sidecar.
+
+### Run host tests
+
+```bash
+cargo test -p shrike_control
+cargo test -p shrike_rp2040_host_sim
+python3 firmware/shrike/rp2040/host-tests/test_flash_contract.py
+```
+
+The simulation crate gains `paired_control.rs` and `fpga_lifecycle.rs` on this branch; see [Drivers and Control Link](/axiomos/fpga-bringup/platform/drivers#paired-motor-sink).
+
+### Recovery before custom flashing
+
+`flash-uf2.sh` verifies the hash sidecar and the flash contract before copying. The contract requires a ready factory recovery image. On this branch `SOURCE.toml` records `factory_uf2.ready = true` for the vendor `shrike-lite-micropython-v1.0.0.uf2` (SHA-256 `fe776218...b42648`), which is now checked in.
+
+The observed entry procedure is: with USB connected, **hold BOOT, press and release RST**, then release BOOT. The RP2040 ROM enumerates as `2e8a:0003` (`RPI-RP2`). Cold BOOT-held USB reconnection failed three times on the identified board; the cause is unknown.
+
+</Steps>
+
+## FPGA safety gate
+
+<Steps>
+
+### Simulate
+
+```bash
+scripts/verify/fpga-safety-gate.sh
+```
+
+This runs the `tb_shrike_safety_gate` testbench and the `tb_axiomos_r04_top` runtime-link testbench with `iverilog`. It produces no synthesis or bitstream evidence.
+
+### Yosys preflight
+
+From the repository root, with the Renesas-bundled Yosys:
+
+```bash
+yosys -s scripts/verify/fpga-safety-preflight.ys
+yosys -s scripts/verify/fpga-mapping-preflight.ys
+```
+
+The second check rejects mapped latches and checks carry blocks against the 140-CLB tile. Neither qualifies pins or produces a bitstream.
+
+### Synthesize in Forge
+
+Open `firmware/shrike/fpga/forgefpga/axiomos_r04.ffpga`. It registers `clk_50mhz.sdc`. For the robustness build, replace it with `clk_18ns_guard.sdc`; never load both. Keep the checked-in mapping and packing settings; changing them requires fresh simulation and timing evidence.
+
+### Verify retained build evidence
+
+```bash
+python3 -B scripts/verify/fpga-build-evidence.py --evidence-dir \
+  .superpowers/sdd/shrike-fpga-bench/vendor-synthesis/timing-closure-20260912
+```
+
+The evidence directory is ignored, operator-local material. The verifier checks the manifest and six builds against the current RTL, settings, SDC and pins, and never rewrites evidence. Its tests run with `python3 -B tests/scripts/test_fpga_build_evidence.py`.
+
+</Steps>
+
+## What is still required before hardware
+
+Powered-off continuity, voltage domains and common ground; PWR/EN/configuration/READY semantics and SPI bounds; post-route hold/pulse and interface timing; actual clock calibration; a qualified flash placement and programming procedure; and the concrete `R04Platform` adapter. See the open-gates table on [Shrike FPGA Safety Gate](/axiomos/fpga-bringup/platform/fpga#open-gates).

@@ -1,0 +1,85 @@
+import { Callout } from 'nextra/components'
+
+# Helpers
+
+**Relevant source files**
+
+- [src/helpers.rs](https://github.com/volnlabs/rbpf/blob/main/src/helpers.rs)
+- [src/lib.rs](https://github.com/volnlabs/rbpf/blob/main/src/lib.rs)
+- [src/aarch64.rs](https://github.com/volnlabs/rbpf/blob/main/src/aarch64.rs)
+- [examples/date.rs](https://github.com/volnlabs/rbpf/blob/main/examples/date.rs)
+- [examples/allowed_memory.rs](https://github.com/volnlabs/rbpf/blob/main/examples/allowed_memory.rs)
+
+A helper is a host function that eBPF code calls with `CALL imm`. rbpf has two separate helper mechanisms: one for the VM wrappers (interpreter, x86_64 JIT, Cranelift) and one for the AArch64 compiler.
+
+## VM wrapper helpers
+
+```rust
+pub type Helper = fn(u64, u64, u64, u64, u64) -> u64;
+
+pub fn register_helper(&mut self, key: u32, function: Helper) -> Result<(), Error>;
+```
+
+Helpers live in a `HashMap<u32, Helper>`, so any `u32` key works. Use the Linux helper numbers if you want kernel-compatible programs. Arguments come from `r1`–`r5` and the return value goes to `r0`.
+
+| Engine | Helper resolution | Unknown ID |
+|---|---|---|
+| Interpreter | Looked up at runtime on each `CALL` | runtime `Err("unknown helper function (id: 0x..)")` |
+| x86_64 JIT | Address embedded at `jit_compile()` | compile-time error |
+| Cranelift | Imported as symbol `helper_<id>` at `cranelift_compile()` | compile-time error |
+
+<Callout type="info">
+For the JITs, register every helper **before** compiling. Registering a new key afterwards has no effect until you recompile. Replacing the function behind an existing key also needs a recompile, because the old function's address is baked into the generated code.
+</Callout>
+
+### Custom helper
+
+```rust
+use std::time::{SystemTime, UNIX_EPOCH};
+
+fn helper_get_time_sec(_: u64, _: u64, _: u64, _: u64, _: u64) -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+}
+
+const HELPER_GET_TIME_SEC_IDX: u32 = 0x01;
+
+let mut vm = rbpf::EbpfVmNoData::new(Some(prog)).unwrap();
+vm.register_helper(HELPER_GET_TIME_SEC_IDX, helper_get_time_sec).unwrap();
+let t = vm.execute_program().unwrap();
+```
+
+### Helpers that return pointers
+
+If a helper returns a pointer to host memory, such as a map value, the interpreter rejects any access through it unless you first whitelist the range:
+
+```rust
+let start = core::ptr::addr_of!(MAP_VALUE) as u64;
+vm.register_allowed_memory(start..start + core::mem::size_of::<Value>() as u64);
+```
+
+`examples/allowed_memory.rs` shows this end to end with a `bpf_map_lookup_elem`-style helper at index 1.
+
+## Built-in helpers (`rbpf::helpers`)
+
+| Function | Index constant | `std` only | Behaviour |
+|---|---|---|---|
+| `bpf_time_getns` | `BPF_KTIME_GETNS_IDX = 5` | yes | Monotonic nanoseconds since the helper's **first call**, not since boot |
+| `bpf_trace_printf` | `BPF_TRACE_PRINTK_IDX = 6` | yes | Prints args 3–5 as hex (`bpf_trace_printf: 0x1, 0xf, 0x20`). Returns the number of bytes written. Args 1–2 are ignored. |
+| `gather_bytes` | — | no | Returns `arg1 << 32 \| arg2 << 24 \| arg3 << 16 \| arg4 << 8 \| arg5`. For example `(0x11, 0x22, 0x33, 0x44, 0x55)` gives `0x1122334455`. |
+| `memfrob` | — | no | XORs `len` bytes at `ptr` with 42 in place. Returns 0. |
+| `sqrti` | — | yes | Integer square root of arg 1 (via `f64`) |
+| `strcmp` | — | no | Compares two NUL-terminated strings (args 1–2). Returns 0 when equal, otherwise the absolute difference of the first differing bytes. Returns `u64::MAX` if either pointer is null. |
+| `rand` | — | yes | WyRand (thread-local, time/thread-seeded) value in `[min, max]` when `min < max` |
+
+The `*_IDX` constants match the Linux helper numbers, so programs compiled for the kernel can call these through the same IDs.
+
+## AArch64 compiler helpers
+
+The AArch64 compiler does **not** use `Helper` or the `HashMap`. Every `CALL imm` (`src = 0`) becomes a call to the embedder's `RuntimeCallbacks.helper`:
+
+```rust
+pub type HelperCallback =
+    unsafe extern "C" fn(opaque: *mut c_void, id: u32, args: *const u64, out: *mut u64) -> u32;
+```
+
+The callback receives the helper ID and a pointer to the five argument values. It writes the result to `*out` and returns 0. Any other return value aborts execution with `STATUS_CALLBACK_ERROR`. The embedder decides which IDs are allowed and what each one does, in AxiomOS according to its verified helper and effect policy. See [Invocation and callback ABI](/rbpf/aarch64-jit/abi).

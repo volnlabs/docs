@@ -1,0 +1,118 @@
+import { Callout, Steps } from 'nextra/components'
+
+# Raspberry Pi 5
+
+Relevant source files
+
+- [scripts/build/rpi5.sh](https://github.com/pro-utkarshM/axiomOS/blob/main/scripts/build/rpi5.sh)
+- [scripts/deploy/rpi5.sh](https://github.com/pro-utkarshM/axiomOS/blob/main/scripts/deploy/rpi5.sh)
+- [kernel/Cargo.toml](https://github.com/pro-utkarshM/axiomOS/blob/main/kernel/Cargo.toml)
+- [docs/operations/hardware-validation-and-benchmarking.md](https://github.com/pro-utkarshM/axiomOS/blob/main/docs/operations/hardware-validation-and-benchmarking.md)
+- [docs/operations/boot.md](https://github.com/pro-utkarshM/axiomOS/blob/main/docs/operations/boot.md)
+- [docs/reference/generated/artifacts.md](https://github.com/pro-utkarshM/axiomOS/blob/main/docs/reference/generated/artifacts.md)
+
+The Raspberry Pi 5 is the primary hardware target. The kernel is built as a raw `kernel8.img` with the ext2 root filesystem embedded via `include_bytes!`, and placed on the FAT32 boot partition of an SD card.
+
+<Callout type="warning">
+Pi 5 testing is manual; there is no hardware-in-the-loop CI. The target manifest labels the Pi 5 `supported after HIL`. Treat QEMU results as preflight evidence only.
+</Callout>
+
+## Build
+
+<Steps>
+
+### Provide the trust key
+
+The kernel embeds the production Ed25519 public key. The script refuses to generate a substitute.
+
+```bash
+export AXIOM_BPF_TRUSTED_KEY_PATH=/secure/path/axiomos-ed25519.pub
+test "$(wc -c < "$AXIOM_BPF_TRUSTED_KEY_PATH")" -eq 32
+```
+
+### Build
+
+```bash
+cargo xtask build rpi5 -- release embedded-rpi5
+```
+
+The script takes two positional arguments after `--`: the profile (`release` or `debug`, default `release`) and the kernel feature list (default `embedded-rpi5`). Use `--dry-run` before `--` to print the delegated command.
+
+### Check outputs
+
+Everything lands under `target/aarch64-unknown-none/release/` (or `debug`, or under `CARGO_TARGET_DIR` if set):
+
+| File | Contents |
+|------|----------|
+| `kernel` | Kernel ELF |
+| `kernel8.img` | Raw binary made with `llvm-objcopy -O binary` (or `rust-objcopy`) |
+| `rpi5-artifacts.sha256` | SHA-256 of the ELF, `kernel8.img`, rootfs image and the trust key file |
+
+</Steps>
+
+What `scripts/build/rpi5.sh` does internally:
+
+1. Installs the `aarch64-unknown-none` target if missing.
+2. Builds the root package with `--no-default-features --features aarch64_deps` to produce the rootfs, and reads `DISK_IMAGE` from a unique `AXIOM_ARTIFACT_PATHS` file.
+3. Exports `AXIOM_DISK_IMAGE` and builds `-p kernel` with the requested features.
+4. Converts the ELF to `kernel8.img` and writes the hash manifest.
+
+### Instrumented images
+
+Build instrumented images separately and never ship them as production, as the hardware runbook specifies:
+
+```bash
+cargo xtask build rpi5 -- release embedded-rpi5,verifier-cost   # verifier-cost calibration
+cargo xtask build rpi5 -- release embedded-rpi5,bench           # GPIO-to-actuation timing
+```
+
+Other feature names in `kernel/Cargo.toml` used by the HIL scripts are `bench-reflex-rearm`, `bench-estop-rearm`, `bench-pwm`, `bench-pwm-containment` and `trace-control-link`. See [Hardware-in-the-loop](/axiomos/main/testing/hardware-in-the-loop).
+
+## Deploy
+
+Inspect first, then write to the mounted boot partition (not the host root filesystem):
+
+```bash
+cargo xtask deploy rpi5 --dry-run -- /path/to/mounted/pi-boot
+cargo xtask deploy rpi5 -- /path/to/mounted/pi-boot
+sync
+```
+
+The deploy script takes the mount point and an optional `debug` or `release` profile. It then:
+
+1. Checks that `kernel8.img` and `rpi5-artifacts.sha256` exist.
+2. Runs `sha256sum -c` against the manifest.
+3. Copies `kernel8.img` and the manifest (as `axiomos-rpi5-artifacts.sha256`) to the card.
+4. Creates `config.txt` only if one does not already exist.
+
+The generated `config.txt` contains:
+
+| Setting | Why |
+|---------|-----|
+| `arm_64bit=1`, `kernel=kernel8.img` | 64-bit boot of the kernel image |
+| `pciex4_reset=0` | Keep RP1 peripherals initialized without a PCIe driver |
+| `enable_rp1_uart=1` | Bare-metal UART0 at 115200 baud through RP1 |
+| `enable_uart=1`, `uart_2ndstage=1` | UART output and early debug output |
+| `disable_splash=1`, `gpu_mem=16` | Faster boot, minimal GPU memory |
+| `dtoverlay=disable-bt` | Bluetooth otherwise uses the UART pins |
+
+<Callout type="info">
+Raspberry Pi boot firmware must already be on the SD card. This repository neither fetches nor pins it. Record its revision and hashes with any HIL evidence.
+</Callout>
+
+## Serial console
+
+Connect a UART debug probe, find a stable path under `/dev/serial/by-id/`, and capture at 115200 baud before applying power:
+
+```bash
+PORT=/dev/serial/by-id/<debug-probe-uart>
+sudo timeout 120s cat "$PORT" | tr -d '\r' | tee pi5-boot.log
+```
+
+The runbook's baseline checks look for `INIT_PROCESS_STARTED` and, on a production image, `SIGNED_BPF_LOAD_OK` from `signed_bpf_loader`. The kernel prints `PI5_BOOT_OK` on the Pi path, and bench images print `PI5_BENCH_READY`. A bench image uses a bounded deferred console; `PI5_BENCH_LOG_LOSS` invalidates any serial-derived measurement.
+
+A wiring sheet for the Pi 5 UART is at `docs/operations/wiring/axiomos-test-01-pi5-uart-wiring.pdf`.
+
+## Known limitations
+
+From the README: user-mode page faults panic the kernel, no demand paging, no POSIX signals, a single global run queue, only GPIO/PWM/UART on RP1 (no I2C, SPI, CAN or Ethernet), and no hardware watchdog integration. See the repository README for the full list.

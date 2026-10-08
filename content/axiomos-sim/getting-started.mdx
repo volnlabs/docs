@@ -1,0 +1,124 @@
+import { Callout, Steps, Tabs } from 'nextra/components'
+
+# Getting Started
+
+**Relevant source files**
+
+- [README.md](https://github.com/volnlabs/voln-vp/blob/main/README.md)
+- [backends/qemu/adapters/doctor.sh](https://github.com/volnlabs/voln-vp/blob/main/backends/qemu/adapters/doctor.sh)
+- [backends/renode/adapters/doctor.sh](https://github.com/volnlabs/voln-vp/blob/main/backends/renode/adapters/doctor.sh)
+- [backends/qemu/runner.py](https://github.com/volnlabs/voln-vp/blob/main/backends/qemu/runner.py)
+- [backends/renode/adapters/run.sh](https://github.com/volnlabs/voln-vp/blob/main/backends/renode/adapters/run.sh)
+- [rust-toolchain.toml](https://github.com/volnlabs/voln-vp/blob/main/rust-toolchain.toml)
+
+## Dependencies
+
+Install through your usual package manager:
+
+| Tool | Used by |
+|---|---|
+| Rust (stable, minimal profile per `rust-toolchain.toml`) | Building and running the `voln-vp` CLI |
+| Python 3 | QEMU runner (`backends/qemu/runner.py`) and adapter tests |
+| QEMU: `qemu-system-x86_64`, `qemu-system-aarch64`, `qemu-system-riscv64` | `qemu` backend |
+| Renode (evidence uses `1.16.1.16973`) | `renode` backend |
+| Bash, GNU coreutils (`timeout`, `realpath`, `sha256sum`, `mktemp`) | Adapter scripts |
+
+Run all commands from the voln-vp checkout. The CLI locates the repository root from `VOLN_VP_ROOT`, or by walking up from the current directory until it finds a directory containing both `Cargo.toml` and `backends/`.
+
+<Steps>
+
+### Check the host with `doctor`
+
+```sh
+cargo run -- doctor
+```
+
+`doctor` runs every discovered backend's `adapters/doctor.sh`. It checks tools only; it does not boot a guest.
+
+- QEMU: requires `python3`, `qemu-system-x86_64`, `qemu-system-aarch64`, `qemu-system-riscv64`; prints `qemu backend ok`.
+- Renode: requires `renode`, `timeout`, `realpath`, `sha256sum`; prints `renode --version` then `renode backend ok`.
+
+The first missing binary prints `MISSING: <binary>` and the CLI exits with that backend's status.
+
+### Boot-test a prebuilt image
+
+<Tabs items={['virt (QEMU AArch64)', 'virt-pi5 (Renode)', 'virt x86_64', 'virt RISC-V']}>
+<Tabs.Tab>
+```sh
+# AArch64 ELF built for virt,cloud-profile with a matching ext2 rootfs containing /bin/init
+AXIOMOS_KERNEL=/path/to/virt/kernel \
+AXIOMOS_DISK_IMAGE=/path/to/disk.img \
+cargo run -- test --board virt
+```
+</Tabs.Tab>
+<Tabs.Tab>
+```sh
+# embedded-rpi5 ELF with a populated embedded rootfs
+AXIOMOS_KERNEL=/path/to/pi5/kernel \
+cargo run -- test --board virt-pi5
+```
+</Tabs.Tab>
+<Tabs.Tab>
+```sh
+VOLN_VP_ARCH=x86_64 \
+AXIOMOS_ISO=/path/to/axiomos.iso AXIOMOS_DISK_IMAGE=/path/to/disk.img \
+AXIOMOS_OVMF_CODE=/path/to/code.fd AXIOMOS_OVMF_VARS=/path/to/vars.fd \
+cargo run -- test --board virt
+```
+</Tabs.Tab>
+<Tabs.Tab>
+```sh
+VOLN_VP_ARCH=riscv64 AXIOMOS_KERNEL=/path/to/riscv-kernel-demo \
+cargo run -- test --board virt
+```
+</Tabs.Tab>
+</Tabs>
+
+Each invocation prints `Artifacts: <dir>` naming a new run directory, then `PASS: ...` or `FAIL: ...` with log tails.
+
+### Inspect the run directory
+
+QEMU retains `uart.log`, `qemu.log`, `version.log`, and `metadata.json`. Renode retains `uart.log`, `renode.log`, `inputs.sha256`, `version.log`, `command.txt`, and the generated `boot.resc` plus symlinks to the kernel and DTB.
+
+</Steps>
+
+<Callout type="warning">
+Supply artifacts from a known build. Do not assume a shared `target/.../kernel` still has the intended profile: input hashes identify bytes, not their source commit or features.
+</Callout>
+
+## Inputs by board and architecture
+
+| Board / architecture | Required environment variables |
+|---|---|
+| `virt`, AArch64 (default) | `AXIOMOS_KERNEL`, `AXIOMOS_DISK_IMAGE` |
+| `virt`, x86_64 | `AXIOMOS_ISO`, `AXIOMOS_DISK_IMAGE`, `AXIOMOS_OVMF_CODE`, `AXIOMOS_OVMF_VARS` |
+| `virt`, RISC-V | `AXIOMOS_KERNEL` (the RISC-V demo ELF) |
+| `virt-pi5`, AArch64 | `AXIOMOS_KERNEL`; optional `VOLN_VP_DTB` (bundled `boards/virt-pi5/virt-pi5.dtb` by default) |
+
+## Environment variables
+
+| Variable | Default | Applies to | Meaning |
+|---|---|---|---|
+| `VOLN_VP_ROOT` | auto-detected | CLI | Repository root containing `boards/` and `backends/` |
+| `VOLN_VP_ARCH` | `aarch64` | QEMU | `aarch64`, `x86_64`, or `riscv64`; anything else exits 2 |
+| `VOLN_VP_TIMEOUT` | `90s` | both | Positive wall-clock duration with optional suffix `s`, `m`, `h`, `d`. Expiry fails with status 124. Invalid values exit 4. |
+| `VOLN_VP_ARTIFACT_DIR` | `/tmp` | both | Parent directory for a **new** run directory on every invocation, so old captures cannot satisfy a new check |
+| `VOLN_VP_VIRTUAL_TIME` | `0.1` | Renode | Virtual seconds passed to `emulation RunFor`; must be positive |
+| `VOLN_VP_BOOT_MARKER` | `=== axiomos eBPF init ===` | `run` only | Diagnostic marker override. `test` ignores it (QEMU) or forces the fixed marker (Renode `test.sh`). |
+| `VOLN_VP_DTB` | bundled DTB | Renode | DTB loaded at `0x10000000` |
+
+## Path rules
+
+- Paths with spaces work.
+- QEMU input paths containing commas are rejected, because commas delimit `-drive` options.
+- The Renode artifact directory may contain only letters, digits, spaces, and `_./-`. Input images are staged into the run directory as symlinks so arbitrary input paths never reach Monitor syntax.
+
+## Running the repository's own tests
+
+```sh
+cargo test --workspace --offline
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s backends/tests -v
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s backends/renode/tests -v
+```
+
+Adapter tests use stand-in emulators. They establish adapter behavior, not guest compatibility.

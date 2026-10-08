@@ -1,0 +1,64 @@
+import { Callout } from 'nextra/components'
+
+# Benchmarks
+
+Relevant source files
+
+- [userspace/benchmarks/system/src/main.rs](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/userspace/benchmarks/system/src/main.rs)
+- [userspace/benchmarks/verifier/src/main.rs](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/userspace/benchmarks/verifier/src/main.rs)
+- [scripts/benchmark/verifier-cost.py](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/scripts/benchmark/verifier-cost.py)
+- [docs/operations/hardware-validation-and-benchmarking.md](https://github.com/pro-utkarshM/axiomOS/blob/feat/v0.5-runtime/docs/operations/hardware-validation-and-benchmarking.md)
+
+<Callout type="warning">
+The README states that the current benchmark authority contains one attributable host-verifier campaign. Legacy Pi, QEMU and Linux numbers are archived until they are rerun with retained raw logs and artifact hashes. These programs generate measurements; they are not themselves published results.
+</Callout>
+
+Two benchmark binaries are installed in `/bin`: `benchmark` and `verifier_bench`.
+
+## benchmark
+
+`userspace/benchmarks/system` prints "AXIOM BENCHMARK RESULTS" and runs two measurements. Boot time and memory footprint are printed by the kernel during boot, not here.
+
+| Step | Measurement |
+|------|-------------|
+| Benchmark 1 | BPF program load time: loads a trivial program (`r0 = 42; exit`) 10 times and reports per-run, min, max and average in microseconds |
+| Benchmark 2 | Timer interrupt interval: attaches a BPF program to the timer that writes into a ringbuf, collects 100 samples, and prints a summary. Reports an incomplete collection with poll counts if fewer arrive |
+
+It uses helpers such as `ktime_get_ns`, `get_interrupt_latency_ns`, `get_boot_time_ms`, `get_kernel_heap_kb` and `get_kernel_image_mb`.
+
+## verifier_bench
+
+`userspace/benchmarks/verifier` is the verifier-cost driver. It loads straight-line and shaped BPF programs of increasing size so that a kernel built with `--features verifier-cost` emits an `AXIOM VERIFIER COST` marker for each load. Its shapes mirror `kernel_bpf::cost_corpus`, so on-device cycles, the host `states_explored` curve and the host wall-clock curve describe the same programs.
+
+| Item | Value |
+|------|-------|
+| Measurement sizes | 10, 50, 100, 500, 1000 instructions |
+| Calibration sizes | 100 and 1000 |
+| Maximum instructions | 1000 |
+| Shapes | straight-line, memory, div, ktime, map, copy |
+| Execution timing | `BPF_BENCH_EXEC` (feature-gated kernel command) runs a program 64 times per sample, 5 samples per program, then unloads it with `BPF_PROG_UNLOAD` |
+| Admission self-test | A `trace_printk` load is rejected on the RT fragment, and a control program attaches successfully |
+
+On this branch the driver no longer creates a ringbuf or runs the ringbuf shape, and it no longer attaches copies of the densest program until the cumulative budget trips. The source comment explains that the per-program and cumulative limits cannot be reached through the process's stricter program-count quota at 100 Hz, so host ledger tests cover those arithmetic boundaries and the device check exercises only the reachable policy ban and a successful attach. The 100 Hz period is described in [Performance](/axiomos/v0.5-runtime/performance).
+
+### Collecting the curve
+
+```bash
+# 1. Build a separate instrumented Pi image
+cargo xtask build rpi5 -- release embedded-rpi5,verifier-cost
+
+# 2. Boot it, run /bin/verifier_bench, capture UART to a log
+
+# 3. Parse the serial log
+cargo xtask bench verifier -- verifier-cost.log \
+  -o verifier-cost.csv --plot verifier-cost.png --cntfrq 54000000
+```
+
+`scripts/benchmark/verifier-cost.py` accepts a log path (or `-` for stdin), `-o/--csv`, `--plot`, `--cntfrq` (counter frequency in Hz, for microsecond conversion) and `--height` (abstract-domain height for the budget overlay). Marker format:
+
+```text
+AXIOM VERIFIER COST prog_id=N insns=N states=N cycles=N [wcet=N]
+AXIOM EXEC COST prog_id=N insns=N runs=N cycles=N
+```
+
+The hardware runbook says to treat zero or saturated counters, missing instrumentation, failed markers or an implausible slope as invalid data, and to confirm the real counter frequency rather than assuming 54 MHz. Instrumented images must never be used as production images. See [Hardware-in-the-loop](/axiomos/v0.5-runtime/testing/hardware-in-the-loop).

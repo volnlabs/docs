@@ -1,0 +1,61 @@
+import { Callout } from 'nextra/components'
+
+# Demos
+
+Relevant source files
+
+- [userspace/demos/gpio_demo/src/main.rs](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/userspace/demos/gpio_demo/src/main.rs)
+- [userspace/demos/iio_demo/src/main.rs](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/userspace/demos/iio_demo/src/main.rs)
+- [userspace/demos/timeseries_demo/src/main.rs](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/userspace/demos/timeseries_demo/src/main.rs)
+- [userspace/demos/sched_switch_demo/src/main.rs](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/userspace/demos/sched_switch_demo/src/main.rs)
+- [userspace/demos/sched_switch_export_demo/src/main.rs](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/userspace/demos/sched_switch_export_demo/src/main.rs)
+- [userspace/demos/sched_switch_bridge_demo/src/main.rs](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/userspace/demos/sched_switch_bridge_demo/src/main.rs)
+- [userspace/demos/safety_demo/src/main.rs](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/userspace/demos/safety_demo/src/main.rs)
+- [ci/manifests/components.toml](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/ci/manifests/components.toml)
+
+The demos under `userspace/demos/` are executable examples and integration probes, not production tools. Most follow the same pattern: create a map, build a small BPF program from raw instructions, `BPF_PROG_LOAD` it, `BPF_PROG_ATTACH` it to a hook, then read results.
+
+## Catalog
+
+All except `safety_demo` are installed in `/bin` of the rootfs.
+
+| Binary | Role (components.toml) | Purpose | Platform notes |
+|--------|------------------------|---------|----------------|
+| `gpio_demo` | GPIO demo | Loads a BPF program attached to GPIO 17 rising edge that toggles an LED on GPIO 18 (button to LED), then runs indefinitely | GPIO attach is Pi 5 only |
+| `pwm_demo` | PWM demo | Creates a ringbuf, attaches an observer program to PWM0 channel 1 that writes PWM events (timestamp, channel, duty, period) to the ringbuf, attaches a timer-driven controller program that varies the duty cycle through the PWM write helper, and prints the observed events | PWM attach is Pi 5 only |
+| `timeseries_demo` | time-series map demo | Creates a `TIMESERIES` map, loads a producer program attached to the timer, and reads the latest timestamp and value from userspace | Timer attach |
+| `iio_demo` | IIO demo | Ringbuf map plus a BPF filter attached to IIO device 0 that keeps sensor values within 100 to 900 (the constants `MIN_VALUE` and `MAX_VALUE`); event layout must match `kernel_bpf/src/attach/iio.rs` | IIO attach is Pi 5 only |
+| `syscall_demo` | syscall demo | Exercises `malloc`, `writev`, `pipe`, `dup`, `dup2`, `read`, `write` and `close` | |
+| `sys_exit_demo` | task-exit probe | Creates a ringbuf, loads a program on the `sys_exit` hook, polls events (`syscall_nr`, `result`). Four-step banner | Gate: target build and QEMU |
+| `sched_switch_demo` | scheduler demo | Creates a ringbuf, loads a `sched_switch` trace program, attaches it, and prints live scheduler events from the same process | |
+| `sched_switch_export_demo` | scheduler export demo | Same hook, but pins the ringbuf at `/sys/fs/bpf/maps/sched_switch_events` with `BPF_OBJ_PIN` so another process can consume it | Used by `smoke-bpf.sh` |
+| `sched_switch_bridge_demo` | scheduler bridge demo | Opens the pinned ringbuf (`BPF_OBJ_GET`), launches a workload (`fork_test` twice and `syscall_demo`), polls up to 120 times and prints events. Tells you to run the export demo first if the object is missing | Consumer half of the pair |
+| `file_io_demo` | filesystem demo | Reads `/bin/init` and writes to `/dev/null` | |
+| `fork_test` | process lifecycle probe | `fork`, child prints and exits 42, parent `waitpid` checks status. Also the `execve` target in init's lifecycle probe | Gate: target build and QEMU |
+| `safety_demo` | safety-state demo | "Legacy BPF reflex demo": a motor program on the timer (PWM0 channel 1 at 50 percent duty) and a monitored limit-switch reflex on GPIO 17. It states it is not the hard e-stop path | Not in the rootfs (disposition `none`) |
+
+<Callout type="warning">
+`safety_demo` prints that it is a monitored BPF reflex path and not the hard e-stop. The hard stop path it points to is `SYS_ESTOP`, the watchdog, and the GPIO24 bench path.
+</Callout>
+
+## Typical sequence: scheduler tracing
+
+```mermaid
+sequenceDiagram
+  participant E as sched_switch_export_demo
+  participant K as Kernel
+  participant B as sched_switch_bridge_demo
+  E->>K: BPF_MAP_CREATE ringbuf
+  E->>K: BPF_PROG_LOAD trace program
+  E->>K: BPF_PROG_ATTACH sched_switch
+  E->>K: BPF_OBJ_PIN sched_switch_events
+  B->>K: BPF_OBJ_GET pinned path
+  B->>K: spawn fork_test and syscall_demo
+  K-->>B: BPF_RINGBUF_POLL events of 40 bytes
+```
+
+Each `sched_switch` event is 40 bytes: `cpu_id`, `prev_pid`, `prev_tid`, `next_pid`, `next_tid`, all `u64`. In the development configuration, `init` spawns the export demo and then the bridge demo. The [UART forwarder](/axiomos/v0.5.0-alpha.3/userspace/tools) reads the same pinned object.
+
+## Running a demo
+
+Demos are plain executables in `/bin`. The README lists a "shell + basic utilities", but the repository only shows `init` auto-starting the loader; to launch another demo, spawn it from a program via `spawn` or `spawn_restricted`, or use whatever shell the kernel provides. Hook availability matters: GPIO, IIO and PWM attach types are listed as Raspberry Pi 5 only in `docs/reference/generated/abi.md`.

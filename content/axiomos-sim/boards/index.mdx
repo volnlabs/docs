@@ -1,0 +1,33 @@
+# Board Manifests
+
+**Relevant source files**
+
+- [cli/src/manifest.rs](https://github.com/volnlabs/voln-vp/blob/main/cli/src/manifest.rs)
+- [cli/src/discovery.rs](https://github.com/volnlabs/voln-vp/blob/main/cli/src/discovery.rs)
+- [boards/virt/board.toml](https://github.com/volnlabs/voln-vp/blob/main/boards/virt/board.toml)
+- [boards/virt-pi5/board.toml](https://github.com/volnlabs/voln-vp/blob/main/boards/virt-pi5/board.toml)
+- [docs/superpowers/specs/2026-07-14-voln-vp-design.md](https://github.com/volnlabs/voln-vp/blob/main/docs/superpowers/specs/2026-07-14-voln-vp-design.md)
+
+Users select **boards**, not simulators: `voln-vp run --board virt-pi5`. Each board is a directory `boards/<name>/` with a simulator-neutral `board.toml` plus per-backend renders in subdirectories (for example `boards/virt-pi5/renode/virt-pi5.repl`). The spec treats the neutral manifest as the source of truth from which backend renders derive.
+
+## Schema read by the CLI
+
+`BoardManifest` deserializes four fields. Other tables (such as `[memory_map]`, `[peripherals]`, `[dtb]`) are ignored by the CLI and serve as documentation of the board.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `name` | string | Matched against `--board` |
+| `memory` | string | Memory size label, for example `"1GB"` |
+| `default_backend` | string | Backend used when `--backend` is omitted |
+| `backends` | array of strings | Backends allowed for this board |
+
+Validation fails if `default_backend` is not in `backends`.
+
+## Boards on `main`
+
+| Board | Memory | Default backend | Backends | Purpose |
+|---|---|---|---|---|
+| [`virt`](/axiomos-sim/boards/virt) | `1GB` | `qemu` | `qemu` | Generic QEMU `virt` smoke boot for AArch64, x86_64, RISC-V |
+| [`virt-pi5`](/axiomos-sim/boards/virt-pi5) | `8GB` | `renode` | `renode` | Renode model of the Raspberry Pi 5 memory map for the `embedded-rpi5` kernel |
+
+A board must also be listed in the backend manifest's `boards` array; both sides must agree before dispatch succeeds.

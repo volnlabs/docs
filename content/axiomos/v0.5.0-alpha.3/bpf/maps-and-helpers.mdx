@@ -1,0 +1,111 @@
+import { Callout } from 'nextra/components'
+
+# Maps and Helpers
+
+Relevant source files
+
+- [kernel/crates/kernel_bpf/src/maps/mod.rs](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/kernel/crates/kernel_bpf/src/maps/mod.rs)
+- [kernel/crates/kernel_bpf/src/maps/array.rs](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/kernel/crates/kernel_bpf/src/maps/array.rs)
+- [kernel/crates/kernel_bpf/src/maps/hash.rs](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/kernel/crates/kernel_bpf/src/maps/hash.rs)
+- [kernel/crates/kernel_bpf/src/maps/ringbuf.rs](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/kernel/crates/kernel_bpf/src/maps/ringbuf.rs)
+- [kernel/crates/kernel_bpf/src/maps/timeseries.rs](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/kernel/crates/kernel_bpf/src/maps/timeseries.rs)
+- [kernel/crates/kernel_bpf/docs/MAPS.md](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/kernel/crates/kernel_bpf/docs/MAPS.md)
+- [kernel/crates/kernel_bpf/src/verifier/helpers.rs](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/kernel/crates/kernel_bpf/src/verifier/helpers.rs)
+- [kernel/crates/kernel_bpf/src/execution/interpreter.rs](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/kernel/crates/kernel_bpf/src/execution/interpreter.rs)
+- [kernel/src/bpf/helpers.rs](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/kernel/src/bpf/helpers.rs)
+- [kernel/crates/kernel_abi/src/bpf.rs](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/kernel/crates/kernel_abi/src/bpf.rs)
+- [kernel/src/bpf/limits.rs](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/kernel/src/bpf/limits.rs)
+
+## Map types
+
+Four map types can be created at runtime through `BPF_MAP_CREATE` (`BpfManager::create_map_for`). Any other type value returns `InvalidInstruction`.
+
+| Type | Value | Constraints at creation | Storage and behaviour |
+|---|---:|---|---|
+| Hash (`BPF_MAP_TYPE_HASH`) | 1 | non-zero key and value size | One flat buffer of `state, key, value` buckets with linear probing; fixed key and value sizes |
+| Array (`BPF_MAP_TYPE_ARRAY`) | 2 | key size must be 4, non-zero value size | Contiguous value bytes indexed by `u32` |
+| Ring buffer (`BPF_MAP_TYPE_RINGBUF`) | 27 | key size 0, value size 0, `max_entries` a power of two (it is the byte size) | Reserve, submit and poll with an 8-byte event header; polling copies one committed event and advances the tail; nonblocking |
+| Time series (`BPF_MAP_TYPE_TIMESERIES`) | 100 | key size 8 (a timestamp), non-zero value size | Circular storage of timestamped fixed-size values |
+
+The `kernel_bpf::maps::MapType` enum names more types (prog array, per-CPU maps, stack trace, cgroup array, and cloud-only LRU hash, LRU per-CPU hash and LPM trie) so that ELF map definitions can be parsed, but the manager does not create them. The ABI catalog lists only the four above.
+
+All constructors validate dimensions, use checked arithmetic for allocation sizes and reserve memory fallibly, returning `MapError` on invalid or exhausted requests. The `resize` operation exists only in cloud builds. Embedded constructors additionally reject any single map whose full allocation exceeds `MEMORY_BUDGET` (64 KiB). There is no static map pool.
+
+### Reserved envelope map
+
+Handle 0 (`ENVELOPE_MAP_ID`) is a kernel-owned, read-only envelope map created at manager construction from the profile's actuation constants. `RESERVED_MAP_COUNT` is 1, so user maps start after it. Mutating helpers on this handle are rejected by the verifier (read-only) and at runtime.
+
+### Kernel quotas (`BpfLimits`)
+
+| Limit | Cloud | Embedded |
+|---|---:|---:|
+| Live programs | 128 | 32 |
+| Program slots | 1024 | 128 |
+| Per-owner programs | 32 | 8 |
+| Total program bytes | 16 MiB | 2 MiB |
+| Single program bytes | 1 MiB | 800 KiB |
+| Per-owner program bytes | 4 MiB | 512 KiB |
+| Max ELF bytes | 1 MiB | 1 MiB |
+| Live maps | 64 | 16 |
+| Map slots | 512 | 64 |
+| Per-owner maps | 16 | 4 |
+| Total map bytes | 64 MiB | 64 KiB |
+| Single map bytes | 16 MiB | 64 KiB |
+| Per-owner map bytes | 16 MiB | 32 KiB |
+| Pinned maps | 128 | 32 |
+| Key size | 512 | 256 |
+| Value size | 64 KiB | 4 KiB |
+| Max entries | 1,048,576 | 4096 |
+
+### Access and sharing
+
+The verifier receives the caller's authoritative view of map sizes, generations and permissions (`MapPerm`: `Unavailable`, `ReadOnly`, `WriteOnly`, `ReadWrite`), and `ProgramRuntime` retains only the maps a program references and is authorized to use. At run time helpers re-resolve the handle through the program's captured map set and re-check access. During execution each map is leased (`MapLease`, up to 128 leases per execution); userspace mutation or destruction of a leased map fails rather than blocks. Pinning and cross-process grants are described in [Trust Model](/axiomos/v0.5.0-alpha.3/bpf/trust-model).
+
+## Helper functions
+
+Helper IDs are defined once in `kernel_abi` and mirrored by the verifier's `HelperId` enum, which is also what the loader relocation table, the WCET cost table and the interpreter dispatch use. The loader source states the IDs are the kernel's own runtime ABI, not the upstream Linux uapi numbering; rkBPF extensions start at 1000.
+
+The table lists every ID in `HelperId`. "Runtime" says whether the interpreter implements it; the others are known to the verifier and signature table but return `InvalidHelper` if executed. Tier is the minimum caller tier (`P` = privileged). "Act." marks helpers that require the actuation capability.
+
+| ID | Name | Purpose | Runtime | Tier | Notes |
+|---:|---|---|---|---|---|
+| 1 | `bpf_ktime_get_ns` | Kernel time in nanoseconds | yes | any | |
+| 2 | `bpf_trace_printk` | Log a message to the kernel log | yes | any | May log; not available on embedded; rejected on timer, GPIO and sched_switch hooks |
+| 3 | `bpf_get_prandom_u32` | Pseudo-random 32-bit value | no | any | |
+| 4 | `bpf_get_smp_processor_id` | Current CPU ID | no | any | |
+| 5 | `bpf_map_lookup_elem` | Look up a map element; returns a maybe-null value pointer | yes | any | |
+| 6 | `bpf_map_update_elem` | Insert or update an element | yes | any | Requires writable map |
+| 7 | `bpf_map_delete_elem` | Delete an element | yes | any | Requires writable map |
+| 8 | `bpf_ringbuf_output` | Copy an event into a ring buffer map | yes | any | Requires writable map |
+| 9 | `bpf_timeseries_push` | Push a timestamped value into a time-series map | yes | any | Requires writable map |
+| 10 | `bpf_get_current_pid_tgid` | Current PID and TGID | no | any | |
+| 11 | `bpf_get_current_uid_gid` | Current UID and GID | no | any | |
+| 12 | `bpf_get_current_comm` | Current process command name into a stack buffer | no | any | |
+| 13 | `bpf_get_interrupt_latency_ns` | Interrupt latency stored in the context | yes | any | |
+| 14 | `bpf_probe_read` | Read from an arbitrary address with safety checks | no | P | |
+| 15 | `bpf_get_boot_time_ms` | Boot time in milliseconds from the context | yes | P | |
+| 16 | `bpf_get_kernel_heap_kb` | Kernel heap usage in KiB from the context | yes | P | |
+| 17 | `bpf_get_kernel_image_mb` | Kernel image size in MiB from the context | yes | P | |
+| 40 | `bpf_ringbuf_reserve` | Reserve ring buffer space; returns a maybe-null pointer | no | any | Not available on embedded |
+| 41 | `bpf_ringbuf_submit` | Submit a reserved entry | no | any | |
+| 42 | `bpf_ringbuf_discard` | Discard a reserved entry | no | any | |
+| 1002 | `bpf_sensor_last_timestamp` | Last timestamp from a sensor | no | any | Relocatable by name |
+| 1003 | `bpf_gpio_set` | Set a GPIO output level | yes | any | Act.; passes through the actuation monitor |
+| 1004 | `bpf_gpio_get` | Read a GPIO input level | yes | any | Returns -1 on invalid pin or non-Pi 5 builds |
+| 1005 | `bpf_pwm_write` | Write a PWM duty (pwm id 0 or 1, channel 1 or 2) | yes | any | Act.; guarded by the actuation monitor; link-owned motor channels are routed over the Shrike link |
+| 1006 | `bpf_iio_read` | Read an IIO sensor value | no | any | |
+| 1007 | `bpf_can_send` | Send a CAN message | no | any | Act. |
+
+Which helpers the ABI catalog advertises as supported: `bpf_ktime_get_ns`, `bpf_trace_printk` (cloud profile only), map lookup/update/delete, `bpf_ringbuf_output`, `bpf_timeseries_push`, `bpf_get_interrupt_latency_ns`, `bpf_get_boot_time_ms`, `bpf_get_kernel_heap_kb`, `bpf_get_kernel_image_mb`, and, on Raspberry Pi 5, `bpf_gpio_set`, `bpf_gpio_get` and `bpf_pwm_write`.
+
+### Argument checking
+
+Each helper has a `HelperSignature` of up to five argument types (`Scalar`, `PtrToMapKey`, `PtrToMapValue`, `PtrToStack`, `PtrToMem`, `MemSize`, `Const`, ring buffer types, and others) and a return type (`Integer`, `PtrToMapValueOrNull`, `PtrToAllocMemOrNull`, `Void`). Pointer returns become maybe-null pointers whose accessible size comes from the map's value size. Memory arguments paired with a size are bounds-checked against the pointed region.
+
+### Actuation
+
+Actuation helpers (`gpio_set`, `pwm_write`, `can_send`) require both the verifier's `allow_actuation` flag (from the process `ACTUATE` capability at load time) and, at runtime, the ARM-A monitor in `kernel_bpf::actuation`. The profile supplies the envelope: on embedded a PWM duty ceiling of 90 percent and a slew limit of 20 per 1 ms window; on cloud these are no-op bounds. A program's authorization snapshot is stored with it, so later privilege changes do not widen an existing program. Kernel helpers `bpf_gpio_toggle` and `bpf_gpio_set_output` exist in `kernel/src/bpf/helpers.rs` but are explicitly not exposed to the BPF ABI.
+
+<Callout type="info">
+The loader's relocation table recognises only 17 helper names (see [Loader](/axiomos/v0.5.0-alpha.3/bpf/loader)); `bpf_gpio_*`, `bpf_pwm_write`, `bpf_iio_read` and `bpf_can_send` cannot be linked by name from an ELF and are called by numeric ID in the bundled demo. The kernel's `bpf_trace_printk` implementation reads a NUL-terminated string from the pointer it is given.
+</Callout>

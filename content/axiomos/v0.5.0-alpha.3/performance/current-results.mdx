@@ -1,0 +1,56 @@
+import { Callout } from 'nextra/components'
+
+# Current Results
+
+**Relevant source files**
+
+- [docs/performance/current-results.md](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/docs/performance/current-results.md)
+- [docs/performance/evidence/2ef74f0/manifest.toml](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/docs/performance/evidence/2ef74f0/manifest.toml)
+- [docs/performance/evidence/2ef74f0/verifier-host.log](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/docs/performance/evidence/2ef74f0/verifier-host.log)
+- [kernel/crates/kernel_bpf/benches/verifier.rs](https://github.com/pro-utkarshM/axiomOS/blob/release/v0.5.0-alpha.3/kernel/crates/kernel_bpf/benches/verifier.rs)
+
+There is exactly **one** attributable campaign today: a host-side benchmark of the BPF verifier. Everything else is historical. Read the [evidence policy](/axiomos/v0.5.0-alpha.3/performance) first.
+
+## Attributable: host BPF verifier at `2ef74f0`
+
+| Field | Value |
+|---|---|
+| Source | `2ef74f0d43b6beeebf24e984d7b8c74ad1b27e8f` |
+| Date | 2026-07-17 |
+| Toolchain | `nightly-2026-07-02`, `rustc 1.98.0-nightly (4c9d2bfe4 2026-07-01)` |
+| Host | Linux 7.0.9 x86_64, AMD Ryzen 7 7735HS, 16 logical CPUs |
+| Command | `CARGO_TERM_COLOR=never cargo bench --locked -p kernel_bpf --bench verifier --features embedded-profile` |
+
+Criterion, 100 samples per group after warm-up; values are the reported 95% confidence intervals for **verification time**.
+
+| Benchmark | 95% CI |
+|---|---:|
+| minimal program | 943.28 to 945.39 ns |
+| arithmetic program | 1.6903 to 1.6936 µs |
+| 10 instructions | 3.1151 to 3.1216 µs |
+| 50 instructions | 15.257 to 15.293 µs |
+| 100 instructions | 31.437 to 31.465 µs |
+| 500 instructions | 180.98 to 183.22 µs |
+| 1000 instructions | 376.43 to 379.28 µs |
+| linear control flow | 1.9926 to 1.9994 µs |
+| one branch | 2.3288 to 2.3420 µs |
+| multiple branches | 3.3792 to 3.3837 µs |
+
+This is a single unpinned developer-host run, not a latency objective and not a cross-machine comparison. Criterion's change annotations (versus an untracked local baseline) are not part of the claim. The roughly linear growth with instruction count is consistent with the [bounded-fragment argument](/axiomos/v0.5.0-alpha.3/security/verifier-assurance), but the campaign measures time on one host, not the state-count bound itself.
+
+## Historical claims and their disposition
+
+| Legacy campaign | Disposition |
+|---|---|
+| QEMU x86 boot, BPF-load and timer numbers | Invalid as timing evidence: the H-02 HPET tick-to-nanosecond conversion was wrong, and no raw capture or hash was kept |
+| Pi 5 boot, memory, BPF and interrupt numbers at `bedc93c` | Historical only: commit and hardware named, but no UART capture or artifact hash |
+| Raspberry Pi OS / Linux comparison | Historical only: no raw `dmesg`, `cyclictest`, binary or hashes |
+| 2026-06 host verifier table | Superseded by `2ef74f0` |
+| Pi 5 verifier/WCET calibration and admission tables | Historical only: UART text not committed, kernel artifact not hashed |
+| ARM-A monitor and GPIO latency | Not measured: requires the physical HIL contract and retained serial and logic-analyzer captures |
+
+The README's interpreter and JIT per-instruction figures (about 50 ns per instruction interpreted on x86_64, under 5 ns JIT overhead) predate this contract and are not backed by an attributable campaign; shipped profiles do not use a JIT at all ([ADR-0004](/axiomos/v0.5.0-alpha.3/decisions/adr-0004-bpf-jit-policy)).
+
+## What would make new RT claims credible
+
+Per the README, multi-core real-time claims need the per-CPU run-queue work (#57), a 24-hour soak with P99 and P99.9 histograms (#74), and attributable comparisons against Zephyr, NuttX or Linux PREEMPT_RT (#78), all captured under the evidence contract.

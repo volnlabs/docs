@@ -1,0 +1,121 @@
+import { Callout, Steps } from 'nextra/components'
+
+# Development
+
+**Relevant source files**
+
+- [cli/src/manifest.rs](https://github.com/volnlabs/voln-vp/blob/main/cli/src/manifest.rs)
+- [cli/src/discovery.rs](https://github.com/volnlabs/voln-vp/blob/main/cli/src/discovery.rs)
+- [cli/tests/backend_dispatch.rs](https://github.com/volnlabs/voln-vp/blob/main/cli/tests/backend_dispatch.rs)
+- [backends/tests/test_adapters.py](https://github.com/volnlabs/voln-vp/blob/main/backends/tests/test_adapters.py)
+- [backends/renode/tests/test_mailbox.py](https://github.com/volnlabs/voln-vp/blob/main/backends/renode/tests/test_mailbox.py)
+- [boards/virt-pi5/renode/virt-pi5.repl](https://github.com/volnlabs/voln-vp/blob/main/boards/virt-pi5/renode/virt-pi5.repl)
+- [TODO_NOW.md](https://github.com/volnlabs/voln-vp/blob/main/TODO_NOW.md)
+- [docs/superpowers/specs/2026-07-14-voln-vp-design.md](https://github.com/volnlabs/voln-vp/blob/main/docs/superpowers/specs/2026-07-14-voln-vp-design.md)
+
+## Repository layout (`main`)
+
+```text
+cli/                    Rust CLI crate voln-vp (src/, tests/)
+backends/
+  qemu/                 manifest.toml, adapters/{doctor,run,test}.sh, runner.py
+  renode/               manifest.toml, adapters/, scripts/boot-virt-pi5.resc,
+                        peripherals/mailbox.py, tests/
+  tests/                test_adapters.py (stand-in emulators)
+boards/
+  virt/                 board.toml, qemu/{aarch64,x86_64,riscv64}.sh
+  virt-pi5/             board.toml, virt-pi5.dts/.dtb, renode/virt-pi5.repl
+renode/probes/          Phase 1 risk-gate .resc, stub DTB, uart-capture.py
+tools/probe-armv8a.sh   Phase 1 driver
+docs/probes/            Dated evidence
+docs/superpowers/specs/ Design spec
+```
+
+## Tests
+
+```sh
+cargo test --workspace --offline
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s backends/tests -v
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s backends/renode/tests -v
+```
+
+| Suite | Covers |
+|---|---|
+| `cli/tests/manifest.rs` | Manifest parsing, default-backend check, unknown verb, reserved `bench` |
+| `cli/tests/discovery.rs` | Name-ordered discovery, invalid manifest path in error, missing directory |
+| `cli/tests/backend_dispatch.rs` | Default/override backend, `test` adapter resolution, clear errors, exit-code propagation, `--dry-run` |
+| `cli/tests/doctor.rs` | Doctor success and failure-code propagation |
+| `cli/tests/cli_smoke.rs` | `--version`, `--help` |
+| `backends/tests/test_adapters.py` | All three QEMU targets, fresh captures, missing inputs, stale UART, fragmented markers, version failure, snapshots, timeouts, signal cleanup, Renode helper cleanup, marker override scope |
+| `backends/renode/tests/` | Mailbox handshake, EL1/no-alias platform contract |
+
+Rust CLI tests use `VOLN_VP_ROOT` pointing at a temporary repository with fake manifests and adapters.
+
+## Adding a board
+
+<Steps>
+
+### Create `boards/<name>/board.toml`
+
+```toml
+name = "my-board"
+memory = "2GB"
+default_backend = "renode"
+backends = ["renode"]
+```
+
+`default_backend` must appear in `backends`. Additional tables such as `[memory_map]`, `[peripherals]`, `[dtb]` are documentation for the neutral description; the CLI ignores them.
+
+### Add per-backend renders
+
+Put backend-specific files in subdirectories, for example `boards/<name>/renode/<name>.repl` or `boards/<name>/qemu/*.sh`. The spec treats `board.toml` as the source of truth and renders as derived.
+
+### List the board in the backend manifest
+
+Add the name to `boards` in `backends/<backend>/manifest.toml`. Dispatch requires agreement on both sides.
+
+### Teach the adapter about it
+
+On `main` the adapters are board-specific: QEMU always uses `boards/virt/qemu/`, and Renode's `run.sh` always uses `boot-virt-pi5.resc` and the `virt-pi5` DTB. A new board needs adapter changes or a new boot script.
+
+</Steps>
+
+## Adding a backend
+
+<Steps>
+
+### Create `backends/<name>/manifest.toml`
+
+```toml
+name = "my-backend"
+verbs = ["run", "test", "doctor"]
+boards = ["my-board"]
+```
+
+Allowed verbs are `run`, `test`, `doctor`. `bench` is reserved and rejected.
+
+### Provide executable adapters
+
+Create `adapters/<verb>.sh` for each verb. The CLI checks only that the file exists, then spawns it with the trailing arguments; it must be executable.
+
+### Follow the exit-code discipline
+
+Return 0 only after a semantic observation (marker in a fresh capture), not merely a zero emulator exit. Propagate emulator failures, use 124 for timeouts, and clean up the emulator's process group. Print `Artifacts: <dir>` and keep logs and input hashes in a fresh run directory.
+
+### Add stand-in tests
+
+Extend `backends/tests/test_adapters.py` with stand-in executables so the adapter's failure paths are tested without a real guest.
+
+</Steps>
+
+No CLI change is needed: discovery is by directory.
+
+## Adding a Renode peripheral model
+
+- On `main`, the only custom peripheral is the inline Python mailbox in `virt-pi5.repl`, mirrored by `backends/renode/peripherals/mailbox.py` and its unit test. Keep both copies aligned, because Renode resolves external Python filenames relative to its installation root.
+- The spec's rules for models: register-accurate for registers axiomOS drivers touch, built only when a driver test demands them, and an unmodeled-register tripwire that warns in development and is fatal in strict mode.
+- The spec planned Python first and C# for hot models. The unmerged RP1 work chose C# up front because the Renode audit showed no reusable RP1/RP2040 models and PCIe/interconnect modeling needs C#. Those models reject unsupported accesses before mutating state and are tested with paired positive and invalid Robot suites. See [RP1 Models](/axiomos-sim/backends/rp1-models).
+
+<Callout type="info">
+`TODO_NOW.md` asks for one commit per task and treats the spec's decisions log as the source of truth for scope. The canonical Renode platform must use real MMU translation at EL1; a high-address alias is not permitted except as an experimental opt-in excluded from semantic gates.
+</Callout>
